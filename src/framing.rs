@@ -3,7 +3,7 @@ use futures::io::AsyncBufReadExt;
 use std::task::Poll;
 use tokio::io::AsyncBufRead;
 
-pub type ParseResult<V> = Poll<Result<(usize, V), FramingError>>;
+pub type ParseResult<V> = Poll<(usize, V)>;
 
 macro_rules! stateful {
     ($start:expr => impl $(< $($typevar:ident),* >)? { $(
@@ -42,7 +42,7 @@ macro_rules! stateful {
                     State::None => unreachable!(),
                     $(State::$state { $(mut $arg,)* $(mut $var,)* } => {
                         let result = match $parser(rest) {
-                            Poll::Ready(Ok((sub, value))) => {
+                            Poll::Ready((sub, value)) => {
                                 let value: $parseout = value;
                                 consumed += sub;
                                 value
@@ -51,7 +51,6 @@ macro_rules! stateful {
                                 state = State::$state { $($arg,)* $($var,)* };
                                 return Poll::Pending;
                             }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         };
                         match result {
                             $($pat => $next),*
@@ -60,14 +59,14 @@ macro_rules! stateful {
                 };
             };
             state = State::None;
-            Poll::Ready(Ok((consumed, result)))
+            Poll::Ready((consumed, result))
         }
     };
 }
 
 pub async fn fold<T, F, V>(reader: &mut T, consumer: &mut F) -> Result<V, FramingError>
 where
-    F: FnMut(&[u8]) -> ParseResult<V>,
+    F: FnMut(&[u8]) -> ParseResult<Result<V, FramingError>>,
     T: AsyncBufRead + Unpin,
 {
     let mut reader = reader.compat_mut();
@@ -76,13 +75,12 @@ where
             break;
         }
         let (consumed, value) = match consumer(buf) {
-            Poll::Ready(Ok((consumed, value))) => (consumed, Some(value)),
+            Poll::Ready((consumed, value)) => (consumed, Some(value)),
             Poll::Pending => (buf.len(), None),
-            Poll::Ready(Err(e)) => return Err(e),
         };
         reader.consume_unpin(consumed);
         if let Some(value) = value {
-            return Ok(value);
+            return value;
         }
     }
     Err(FramingError::End)
