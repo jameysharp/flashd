@@ -1,30 +1,8 @@
-use futures::future::poll_fn;
-use pin_project::pin_project;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use async_compat::CompatExt;
+use futures::io::AsyncBufReadExt;
 use tokio::io::AsyncBufRead;
 
 pub type ParseResult<V> = Result<Option<(usize, V)>, FramingError>;
-
-pub async fn parse<R, F, V>(mut reader: Pin<&mut R>, mut f: F) -> std::io::Result<V>
-where
-    R: AsyncBufRead,
-    F: FnMut(&[u8]) -> std::io::Result<(usize, V)>,
-{
-    poll_fn(|cx| {
-        match reader.as_mut().poll_fill_buf(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(buf) => Poll::Ready(match buf.and_then(&mut f) {
-                Err(e) => Err(e),
-                Ok((consumed, v)) => {
-                    reader.as_mut().consume(consumed);
-                    Ok(v)
-                }
-            }),
-        }
-    }).await
-}
 
 macro_rules! stateful {
     ($start:expr => impl $(< $($typevar:ident),* >)? { $(
@@ -86,12 +64,26 @@ macro_rules! stateful {
     };
 }
 
-pub fn fold<'a, T, F, V>(reader: &'a mut T, consumer: &'a mut F) -> Fold<'a, T, F>
+pub async fn fold<T, F, V>(reader: &mut T, consumer: &mut F) -> Result<V, FramingError>
 where
     F: FnMut(&[u8]) -> ParseResult<V>,
     T: AsyncBufRead + Unpin,
 {
-    Fold { reader, consumer }
+    let mut reader = reader.compat_mut();
+    while let Ok(buf) = reader.fill_buf().await {
+        if buf.is_empty() {
+            break;
+        }
+        let (consumed, value) = match consumer(buf)? {
+            Some((consumed, value)) => (consumed, Some(value)),
+            None => (buf.len(), None),
+        };
+        reader.consume_unpin(consumed);
+        if let Some(value) = value {
+            return Ok(value);
+        }
+    }
+    Err(FramingError::End)
 }
 
 #[derive(Clone, Copy)]
@@ -99,40 +91,4 @@ pub enum FramingError {
     End,
     BadSyntax,
     BadVersion,
-}
-
-#[pin_project]
-pub struct Fold<'a, T, F> {
-    #[pin]
-    reader: &'a mut T,
-    consumer: &'a mut F,
-}
-
-impl<'a, T, F, V> Future for Fold<'a, T, F>
-where
-    F: FnMut(&[u8]) -> ParseResult<V>,
-    T: AsyncBufRead + Unpin,
-{
-    type Output = Result<V, FramingError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.project();
-        while let Poll::Ready(result) = this.reader.as_mut().poll_fill_buf(cx) {
-            match result {
-                Ok(buf) if !buf.is_empty() => {
-                    let (consumed, value) = match (this.consumer)(buf) {
-                        Ok(Some((consumed, value))) => (consumed, Some(value)),
-                        Ok(None) => (buf.len(), None),
-                        Err(e) => return Poll::Ready(Err(e)),
-                    };
-                    this.reader.as_mut().consume(consumed);
-                    if let Some(value) = value {
-                        return Poll::Ready(Ok(value));
-                    }
-                }
-                _ => return Poll::Ready(Err(FramingError::End)),
-            }
-        }
-        return Poll::Pending;
-    }
 }
