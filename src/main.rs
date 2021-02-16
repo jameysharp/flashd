@@ -4,6 +4,7 @@ use blake2::{Blake2s, Digest};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
+use std::task::Poll;
 use tokio::io::AsyncBufRead;
 use tokio::net::TcpListener;
 
@@ -27,30 +28,37 @@ fn skip(mut amt: usize) -> impl FnMut(&[u8]) -> ParseResult<()> {
     move |buf| {
         if let Some(rem) = amt.checked_sub(buf.len()).and_then(NonZeroUsize::new) {
             amt = rem.get();
-            Ok(None)
+            Poll::Pending
         } else {
-            Ok(Some((amt, ())))
+            Poll::Ready(Ok((amt, ())))
         }
     }
 }
 
+fn skip_line_to(buf: &[u8], delim: u8) -> ParseResult<bool> {
+    match memchr::memchr3(b'\r', b'\n', delim, buf) {
+        Some(index) => {
+            let found = buf[index] == delim;
+            Poll::Ready(Ok((index + found as usize, found)))
+        }
+        None => Poll::Pending,
+    }
+}
+
 fn skip_line_to_comma(buf: &[u8]) -> ParseResult<bool> {
-    Ok(memchr::memchr3(b'\r', b'\n', b',', buf).map(|index| {
-        let found = buf[index] == b',';
-        (index + found as usize, found)
-    }))
+    skip_line_to(buf, b',')
 }
 
 fn skip_line_to_space(buf: &[u8]) -> ParseResult<bool> {
-    Ok(memchr::memchr3(b'\r', b'\n', b' ', buf).map(|index| {
-        let found = buf[index] == b' ';
-        (index + found as usize, found)
-    }))
+    skip_line_to(buf, b' ')
 }
 
 fn skip_line() -> impl FnMut(&[u8]) -> ParseResult<()> {
     fn skip_until_newline(buf: &[u8]) -> ParseResult<()> {
-        Ok(memchr::memchr2(b'\r', b'\n', buf).map(|index| (index, ())))
+        match memchr::memchr2(b'\r', b'\n', buf) {
+            Some(index) => Poll::Ready(Ok((index, ()))),
+            None => Poll::Pending,
+        }
     }
 
     stateful! {
@@ -62,12 +70,15 @@ fn skip_line() -> impl FnMut(&[u8]) -> ParseResult<()> {
 }
 
 fn skip_spaces(buf: &[u8]) -> ParseResult<()> {
-    Ok(buf.iter().position(|&b| b != b' ').map(|index| (index, ())))
+    match buf.iter().position(|&b| b != b' ') {
+        Some(index) => Poll::Ready(Ok((index, ()))),
+        None => Poll::Pending,
+    }
 }
 
 fn expect(buf: &[u8], expected: u8) -> ParseResult<bool> {
     let matched = buf[0] == expected;
-    Ok(Some((matched as usize, matched)))
+    Poll::Ready(Ok((matched as usize, matched)))
 }
 
 fn colon(buf: &[u8]) -> ParseResult<bool> {
@@ -129,14 +140,14 @@ where
     move |buf| {
         if let Some(index) = memchr::memchr3(b'\r', b'\n', b' ', buf) {
             if buf[index] != b' ' {
-                Err(FramingError::BadSyntax)
+                Poll::Ready(Err(FramingError::BadSyntax))
             } else {
                 consumer(&buf[..index]);
-                Ok(Some((index + 1, ())))
+                Poll::Ready(Ok((index + 1, ())))
             }
         } else {
             consumer(buf);
-            Ok(None)
+            Poll::Pending
         }
     }
 }
@@ -156,7 +167,7 @@ where
                 Some(method) => Target(Some(method), target),
             }
             for SkipMethod(target: T) match skip_line_to_space => bool {
-                false => return Err(FramingError::BadSyntax),
+                false => return Poll::Ready(Err(FramingError::BadSyntax)),
                 true => Target(None, target),
             }
             for Target(method: Option<MV>, target: T)
@@ -167,7 +178,7 @@ where
             let versions: V = matcher::matcher(Natural::ORDER, &[(b"HTTP/1.0", 0), (b"HTTP/1.1", 1)]);
             match versions => Option<u8> {
                 Some(version) => Newline(method, target, version),
-                None => return Err(FramingError::BadVersion),
+                None => return Poll::Ready(Err(FramingError::BadVersion)),
             }
             for Newline(method: Option<MV>, target: TV, version: u8)
             let p: N = required_newline();
@@ -231,7 +242,7 @@ fn newline() -> impl FnMut(&[u8]) -> ParseResult<bool> {
             }
             for RequireLF() match lf => bool {
                 true => break true,
-                false => return Err(FramingError::BadSyntax),
+                false => return Poll::Ready(Err(FramingError::BadSyntax)),
             }
             for OptionalLF() match lf => bool {
                 found => break found,
@@ -246,7 +257,7 @@ fn required_newline() -> impl FnMut(&[u8]) -> ParseResult<()> {
             for Start() match cr => bool { _ => RequireLF() }
             for RequireLF() match lf => bool {
                 true => break,
-                false => return Err(FramingError::BadSyntax),
+                false => return Poll::Ready(Err(FramingError::BadSyntax)),
             }
         }
     }
@@ -264,14 +275,14 @@ fn number(radix: u8) -> impl FnMut(&[u8]) -> ParseResult<Option<usize>> + Clone 
                     value = last + usize::from(digit as u8);
                     valid = true;
                 } else {
-                    return Ok(Some((idx, None)));
+                    return Poll::Ready(Ok((idx, None)));
                 }
             } else {
                 let result = if valid { Some(value) } else { None };
-                return Ok(Some((idx, result)));
+                return Poll::Ready(Ok((idx, result)));
             }
         }
-        Ok(None)
+        Poll::Pending
     }
 }
 
@@ -298,7 +309,7 @@ where
     E: FnMut(&[u8]) -> ParseResult<Option<()>>,
 {
     fn peek_dquote(buf: &[u8]) -> ParseResult<bool> {
-        Ok(Some((0, buf[0] == b'"')))
+        Poll::Ready(Ok((0, buf[0] == b'"')))
     }
 
     stateful! {
@@ -337,7 +348,7 @@ fn chunked() -> impl FnMut(&[u8]) -> ParseResult<()> {
     stateful! {
         Chunk() => impl<N, L, S, E, T> {
             for Chunk() let p: N = number(16); match p => Option<usize> {
-                None => return Err(FramingError::BadSyntax),
+                None => return Poll::Ready(Err(FramingError::BadSyntax)),
                 Some(len) => Line(len),
             }
             for Line(len: usize) let p: L = skip_line(); match p => () {

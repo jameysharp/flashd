@@ -1,8 +1,9 @@
 use async_compat::CompatExt;
 use futures::io::AsyncBufReadExt;
+use std::task::Poll;
 use tokio::io::AsyncBufRead;
 
-pub type ParseResult<V> = Result<Option<(usize, V)>, FramingError>;
+pub type ParseResult<V> = Poll<Result<(usize, V), FramingError>>;
 
 macro_rules! stateful {
     ($start:expr => impl $(< $($typevar:ident),* >)? { $(
@@ -34,23 +35,23 @@ macro_rules! stateful {
             let result = loop {
                 let rest = &buf[consumed..];
                 if rest.is_empty() {
-                    return Ok(None);
+                    return Poll::Pending;
                 }
 
                 state = match ::std::mem::replace(&mut state, State::None) {
                     State::None => unreachable!(),
                     $(State::$state { $(mut $arg,)* $(mut $var,)* } => {
                         let result = match $parser(rest) {
-                            Ok(Some((sub, value))) => {
+                            Poll::Ready(Ok((sub, value))) => {
                                 let value: $parseout = value;
                                 consumed += sub;
                                 value
                             }
-                            Ok(None) => {
+                            Poll::Pending => {
                                 state = State::$state { $($arg,)* $($var,)* };
-                                return Ok(None);
+                                return Poll::Pending;
                             }
-                            Err(e) => return Err(e),
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         };
                         match result {
                             $($pat => $next),*
@@ -59,7 +60,7 @@ macro_rules! stateful {
                 };
             };
             state = State::None;
-            Ok(Some((consumed, result)))
+            Poll::Ready(Ok((consumed, result)))
         }
     };
 }
@@ -74,9 +75,10 @@ where
         if buf.is_empty() {
             break;
         }
-        let (consumed, value) = match consumer(buf)? {
-            Some((consumed, value)) => (consumed, Some(value)),
-            None => (buf.len(), None),
+        let (consumed, value) = match consumer(buf) {
+            Poll::Ready(Ok((consumed, value))) => (consumed, Some(value)),
+            Poll::Pending => (buf.len(), None),
+            Poll::Ready(Err(e)) => return Err(e),
         };
         reader.consume_unpin(consumed);
         if let Some(value) = value {

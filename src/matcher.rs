@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::marker::PhantomData;
+use std::task::Poll;
 
 use crate::framing::ParseResult;
 
@@ -82,7 +83,7 @@ where
     /// which can't match the input seen so far are removed from future consideration. The portions
     /// which have just been checked are also ignored in future calls.
     pub fn push(&mut self, input: &[C::Item]) -> ParseResult<Option<V>> {
-        Ok(None)
+        Poll::Pending
     }
 }
 
@@ -134,10 +135,10 @@ loop {
     patterns = &patterns[..hi];
 
     match patterns {
-        [] => return Ok(None),
+        [] => return Poll::Pending,
         [(pattern, value)] if pattern.len() <= self.buffer.len() => {
             self.buffer.advance(pattern.len());
-            return Ok(Some(*value));
+            return Poll::Ready(Ok(*value));
         }
         _ => {}
     }
