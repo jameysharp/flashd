@@ -1,82 +1,29 @@
 use async_compat::CompatExt;
 use futures::io::AsyncBufReadExt;
+use futures::pin_mut;
+use std::future::Future;
 use std::task::Poll;
 use tokio::io::AsyncBufRead;
 
+use crate::parsing::run;
+
 pub type ParseResult<V> = Poll<(usize, V)>;
 
-macro_rules! stateful {
-    ($start:expr => impl $(< $($typevar:ident),* >)? { $(
-        for $state:ident
-        ( $($arg:ident : $argty:ty),* )
-        $(let $var:ident : $varty:ty = $init:expr ;)*
-        match $parser:expr => $parseout:ty { $($pat:pat => $next:expr),* $(,)? }
-    )* }) => {
-        enum State $(<$($typevar),*>)? {
-            None,
-            $($state {
-                $($arg: $argty,)*
-                $($var: $varty,)*
-            },)*
-        }
-
-        $(#[allow(non_snake_case)]
-        let $state = move |$($arg: $argty),*| {
-            $(let $var = $init;)*
-            State::$state {
-                $($arg,)*
-                $($var,)*
-            }
-        };)*
-
-        let mut state = $start;
-        move |buf| {
-            let mut consumed = 0;
-            let result = loop {
-                let rest = &buf[consumed..];
-                if rest.is_empty() {
-                    return Poll::Pending;
-                }
-
-                state = match ::std::mem::replace(&mut state, State::None) {
-                    State::None => unreachable!(),
-                    $(State::$state { $(mut $arg,)* $(mut $var,)* } => {
-                        let result = match $parser(rest) {
-                            Poll::Ready((sub, value)) => {
-                                let value: $parseout = value;
-                                consumed += sub;
-                                value
-                            }
-                            Poll::Pending => {
-                                state = State::$state { $($arg,)* $($var,)* };
-                                return Poll::Pending;
-                            }
-                        };
-                        match result {
-                            $($pat => $next),*
-                        }
-                    })*
-                };
-            };
-            state = State::None;
-            Poll::Ready((consumed, result))
-        }
-    };
-}
-
-pub async fn fold<T, F, V>(reader: &mut T, consumer: &mut F) -> Result<V, FramingError>
+pub async fn fold<T, F, V>(reader: &mut T, consumer: F) -> Result<V, FramingError>
 where
-    F: FnMut(&[u8]) -> ParseResult<Result<V, FramingError>>,
+    F: Future<Output = Result<V, FramingError>>,
     T: AsyncBufRead + Unpin,
 {
+    pin_mut!(consumer);
     let mut reader = reader.compat_mut();
-    while let Ok(buf) = reader.fill_buf().await {
-        if buf.is_empty() {
+    while let Ok(mut buf) = reader.fill_buf().await {
+        let initial_len = buf.len();
+        if initial_len == 0 {
             break;
         }
-        let (consumed, value) = match consumer(buf) {
-            Poll::Ready((consumed, value)) => (consumed, Some(value)),
-            Poll::Pending => (buf.len(), None),
+        let (consumed, value) = match run(&mut buf, consumer.as_mut()) {
+            Poll::Ready(value) => (initial_len - buf.len(), Some(value)),
+            Poll::Pending => (initial_len, None),
         };
         reader.consume_unpin(consumed);
         if let Some(value) = value {
