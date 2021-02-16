@@ -2,9 +2,11 @@
 
 use blake2::{Blake2s, Digest};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::future::Future;
 use std::num::NonZeroUsize;
+use std::rc::Rc;
 use std::task::Poll;
 use tokio::io::AsyncBufRead;
 use tokio::net::TcpListener;
@@ -238,9 +240,9 @@ async fn byte_ranges(ranges: &mut ByteRanges) -> Result<(), FramingError> {
     skip_line().await
 }
 
-async fn parse_if_range<E>(etags: E) -> Result<RangeCondition, FramingError>
+async fn parse_if_range<E, V>(etags: E) -> Result<RangeCondition<V>, FramingError>
 where
-    E: Future<Output = Option<()>>,
+    E: Future<Output = Option<V>>,
 {
     async fn peek_dquote() -> bool {
         parsing::with_buf(|buf| Poll::Ready((0, buf[0] == b'"'))).await
@@ -268,23 +270,149 @@ where
     }
 }
 
-// https://tools.ietf.org/html/rfc7230#section-4.1
-async fn chunked() -> Result<(), FramingError> {
-    loop {
-        let len = number(16).await.ok_or(FramingError::BadSyntax)?;
-        skip_line().await?;
-        if len == 0 {
-            break;
+struct MessageHeader<'a, E> {
+    etags: Vec<(&'a [u8], E)>,
+    body: Body,
+    persistent: bool,
+    if_none_match: HashSet<E>,
+    if_modified_since: Option<i64>,
+    range: ByteRanges,
+    if_range: Option<RangeCondition<E>>,
+}
+
+impl<'a, E: Copy + Eq + std::hash::Hash> MessageHeader<'a, E> {
+    pub fn new(etags: Vec<(&'a [u8], E)>, version: u8) -> Self {
+        MessageHeader {
+            etags,
+            body: Body::None,
+            persistent: version >= 1,
+            if_none_match: HashSet::new(),
+            if_modified_since: None,
+            range: ByteRanges,
+            if_range: None,
         }
-        skip(len).await;
-        required_newline().await?;
     }
 
-    while !newline().await? {
-        skip_line().await?;
+    pub async fn parse_header_value(&mut self, header: Header) -> Result<(), FramingError> {
+        match header {
+            // https://tools.ietf.org/html/rfc7230#section-3.3.2
+            Header::ContentLength => {
+                comma_separated(
+                    || number(10),
+                    |length| {
+                        if let Some(length) = length {
+                            self.body.update(Body::Length(length))
+                        } else {
+                            Err(FramingError::BadSyntax)
+                        }
+                    },
+                    ).await
+            }
+
+            // https://tools.ietf.org/html/rfc7230#section-3.3.1
+            Header::TransferEncoding => {
+                // If the request is using Transfer-Encoding, the "chunked" encoding
+                // must be present, exactly once, at the end of the list. We don't care
+                // about any others because we don't interpret the message body.
+                let transfer_codings = matcher::matcher(CaseInsensitiveASCII, &[(b"chunked", ())]);
+                comma_separated(
+                    || parsing::with_buf(transfer_codings.clone()),
+                    |value| {
+                        self.body.update(if value.is_some() {
+                            Body::Chunked
+                        } else {
+                            Body::None
+                        })
+                    },
+                    ).await?;
+
+                if !matches!(self.body, Body::Chunked) {
+                    Err(FramingError::BadSyntax)
+                } else {
+                    Ok(())
+                }
+            }
+
+            // https://tools.ietf.org/html/rfc7230#section-6.1
+            Header::Connection => {
+                let keepalive_options = matcher::matcher(
+                    CaseInsensitiveASCII,
+                    &[(b"close", false), (b"keep-alive", true)],
+                );
+                comma_separated(
+                    || parsing::with_buf(keepalive_options.clone()),
+                    |value| {
+                        if let Some(keepalive) = value {
+                            self.persistent = keepalive;
+                        }
+                        Ok(())
+                    },
+                    ).await
+            }
+
+            // https://tools.ietf.org/html/rfc7232#section-3.2
+            Header::IfNoneMatch => {
+                let mut if_none_match = std::mem::replace(&mut self.if_none_match, HashSet::new());
+                let etags = matcher::matcher(Natural::ORDER, &self.etags);
+                comma_separated(
+                    || parsing::with_buf(etags.clone()),
+                    |value| {
+                        // We only care about ETags that match some representation we currently
+                        // have for this resource.
+                        if let Some(value) = value {
+                            if_none_match.insert(value);
+                        }
+                        Ok(())
+                    },
+                ).await?;
+                self.if_none_match = if_none_match;
+                Ok(())
+            }
+
+            // https://tools.ietf.org/html/rfc7232#section-3.3
+            Header::IfModifiedSince => {
+                self.if_modified_since = http_date().await?;
+                Ok(())
+            }
+
+            // https://tools.ietf.org/html/rfc7233#section-3.1
+            Header::Range => byte_ranges(&mut self.range).await,
+
+            // https://tools.ietf.org/html/rfc7233#section-3.2
+            Header::IfRange => {
+                let etags = matcher::matcher(Natural::ORDER, &self.etags);
+                self.if_range = Some(
+                    parse_if_range(parsing::with_buf(etags.clone())).await?,
+                );
+                Ok(())
+            }
+        }
     }
 
-    Ok(())
+    pub async fn finish(&self) -> Result<bool, FramingError> {
+        match self.body {
+            Body::None => {}
+            Body::Length(n) => skip(n).await,
+            Body::Chunked => {
+                // https://tools.ietf.org/html/rfc7230#section-4.1
+                loop {
+                    let len = number(16).await.ok_or(FramingError::BadSyntax)?;
+                    skip_line().await?;
+                    if len == 0 {
+                        break;
+                    }
+                    skip(len).await;
+                    required_newline().await?;
+                }
+
+                while !newline().await? {
+                    skip_line().await?;
+                }
+            }
+        }
+
+        Ok(self.persistent)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -336,17 +464,10 @@ impl Body {
     }
 }
 
-enum RangeCondition {
+enum RangeCondition<E> {
     Failed,
-    ETag(()),
+    ETag(E),
     LastModified(i64),
-}
-
-async fn ok<F, V>(f: F) -> Result<V, FramingError>
-where
-    F: Future<Output = V>,
-{
-    Ok(f.await)
 }
 
 async fn message<T: AsyncBufRead + Unpin>(reader: &mut T) -> Result<bool, FramingError> {
@@ -368,159 +489,34 @@ async fn message<T: AsyncBufRead + Unpin>(reader: &mut T) -> Result<bool, Framin
     let path = base64::encode_config(&req_hash.finalize(), base64::URL_SAFE_NO_PAD);
     let resource = ();
 
-    let mut headers = Cow::from(&BASE_HEADERS[..]);
+    let mut known_headers = Cow::from(&BASE_HEADERS[..]);
 
     // TODO: if the selected resource has any negotiation headers ...
     let negotiations = Vec::new();
     if !negotiations.is_empty() {
-        let headers = headers.to_mut();
-        headers.extend_from_slice(&negotiations);
-        headers.sort_unstable_by(|(a, _), (b, _)| CaseInsensitiveASCII.cmp(a, b));
+        let known_headers = known_headers.to_mut();
+        known_headers.extend_from_slice(&negotiations);
+        known_headers.sort_unstable_by(|(a, _), (b, _)| CaseInsensitiveASCII.cmp(a, b));
     }
 
     // TODO: if the selected resource has any representations with etags ...
     let etags: Vec<(&[u8], ())> = Vec::new();
 
-    let headers = matcher::matcher(CaseInsensitiveASCII, &headers);
-    let etags = matcher::matcher(Natural::ORDER, &etags);
+    let known_headers = matcher::matcher(CaseInsensitiveASCII, &known_headers);
 
-    let transfer_codings = matcher::matcher(CaseInsensitiveASCII, &[(b"chunked", ())]);
-    let keepalive_options = matcher::matcher(
-        CaseInsensitiveASCII,
-        &[(b"close", false), (b"keep-alive", true)],
-    );
+    let mut message_header = Rc::new(RefCell::new(MessageHeader::new(etags, version)));
 
-    // Requests have a body iff either Content-Length or Transfer-Encoding is present.
-    // https://tools.ietf.org/html/rfc7230#section-3.3
-    let mut body = Body::None;
-
-    // Request persistence depends on the HTTP version of the request and the presence of either
-    // "close" or "keep-alive" options in a Connection header.
-    // https://tools.ietf.org/html/rfc7230#section-6.3
-    let mut persistent = version >= 1;
-
-    // https://tools.ietf.org/html/rfc7232#section-3.2
-    let mut if_none_match = HashSet::new();
-
-    // https://tools.ietf.org/html/rfc7232#section-3.3
-    let mut if_modified_since = None;
-
-    // https://tools.ietf.org/html/rfc7233#section-3.1
-    let mut range = ByteRanges;
-
-    // https://tools.ietf.org/html/rfc7233#section-3.2
-    let mut if_range = None;
-
-    while !fold(reader, newline()).await? {
-        if let Some(header) = fold(reader, ok(parsing::with_buf(headers.clone()))).await? {
-            if fold(reader, ok(colon())).await? {
-                fold(reader, ok(skip_spaces())).await?;
-                match header {
-                    // https://tools.ietf.org/html/rfc7230#section-3.3.2
-                    Header::ContentLength => {
-                        fold(
-                            reader,
-                            comma_separated(
-                                || number(10),
-                                |length| {
-                                    if let Some(length) = length {
-                                        body.update(Body::Length(length))
-                                    } else {
-                                        Err(FramingError::BadSyntax)
-                                    }
-                                },
-                            ),
-                        )
-                        .await?;
-                    }
-
-                    // https://tools.ietf.org/html/rfc7230#section-3.3.1
-                    Header::TransferEncoding => {
-                        // If the request is using Transfer-Encoding, the "chunked" encoding
-                        // must be present, exactly once, at the end of the list. We don't care
-                        // about any others because we don't interpret the message body.
-                        fold(
-                            reader,
-                            comma_separated(
-                                || parsing::with_buf(transfer_codings.clone()),
-                                |value| {
-                                    body.update(if value.is_some() {
-                                        Body::Chunked
-                                    } else {
-                                        Body::None
-                                    })
-                                },
-                            ),
-                        )
-                        .await?;
-                        if !matches!(body, Body::Chunked) {
-                            return Err(FramingError::BadSyntax);
-                        }
-                    }
-
-                    // https://tools.ietf.org/html/rfc7230#section-6.1
-                    Header::Connection => {
-                        fold(
-                            reader,
-                            comma_separated(
-                                || parsing::with_buf(keepalive_options.clone()),
-                                |value| {
-                                    if let Some(keepalive) = value {
-                                        persistent = keepalive;
-                                    }
-                                    Ok(())
-                                },
-                            ),
-                        )
-                        .await?;
-                    }
-
-                    // https://tools.ietf.org/html/rfc7232#section-3.2
-                    Header::IfNoneMatch => {
-                        fold(
-                            reader,
-                            comma_separated(
-                                || parsing::with_buf(etags.clone()),
-                                |value| {
-                                    // We only care about ETags that match some representation we currently
-                                    // have for this resource.
-                                    if let Some(value) = value {
-                                        if_none_match.insert(value);
-                                    }
-                                    Ok(())
-                                },
-                            ),
-                        )
-                        .await?;
-                    }
-
-                    // https://tools.ietf.org/html/rfc7232#section-3.3
-                    Header::IfModifiedSince => {
-                        if_modified_since = fold(reader, http_date()).await?
-                    }
-
-                    // https://tools.ietf.org/html/rfc7233#section-3.1
-                    Header::Range => fold(reader, byte_ranges(&mut range)).await?,
-
-                    // https://tools.ietf.org/html/rfc7233#section-3.2
-                    Header::IfRange => {
-                        if_range = Some(
-                            fold(reader, parse_if_range(parsing::with_buf(etags.clone()))).await?,
-                        )
-                    }
-                }
-                continue;
+    fold(reader, headers(
+        || parsing::with_buf(known_headers.clone()),
+        |header| {
+            let message_header = message_header.clone();
+            async move {
+                let mut message_header = message_header.borrow_mut();
+                message_header.parse_header_value(header.clone()).await
             }
-        }
+        },
+    )).await?;
 
-        fold(reader, skip_line()).await?;
-    }
-
-    match body {
-        Body::None => {}
-        Body::Length(n) => fold(reader, ok(skip(n))).await?,
-        Body::Chunked => fold(reader, chunked()).await?,
-    }
-
-    Ok(persistent)
+    let keep_alive = fold(reader, message_header.borrow().finish()).await?;
+    Ok(keep_alive)
 }
