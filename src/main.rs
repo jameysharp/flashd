@@ -163,11 +163,9 @@ where
 {
     while !newline().await? {
         if let Some(v) = name().await {
-            if colon().await {
-                skip_spaces().await;
-                value(v).await?;
-                continue;
-            }
+            skip_spaces().await;
+            value(v).await?;
+            continue;
         }
         skip_line().await?;
     }
@@ -306,7 +304,8 @@ impl<'a, E: Copy + Eq + std::hash::Hash> MessageHeader<'a, E> {
                             Err(FramingError::BadSyntax)
                         }
                     },
-                    ).await
+                )
+                .await
             }
 
             // https://tools.ietf.org/html/rfc7230#section-3.3.1
@@ -324,7 +323,8 @@ impl<'a, E: Copy + Eq + std::hash::Hash> MessageHeader<'a, E> {
                             Body::None
                         })
                     },
-                    ).await?;
+                )
+                .await?;
 
                 if !matches!(self.body, Body::Chunked) {
                     Err(FramingError::BadSyntax)
@@ -347,7 +347,8 @@ impl<'a, E: Copy + Eq + std::hash::Hash> MessageHeader<'a, E> {
                         }
                         Ok(())
                     },
-                    ).await
+                )
+                .await
             }
 
             // https://tools.ietf.org/html/rfc7232#section-3.2
@@ -364,7 +365,8 @@ impl<'a, E: Copy + Eq + std::hash::Hash> MessageHeader<'a, E> {
                         }
                         Ok(())
                     },
-                ).await?;
+                )
+                .await?;
                 self.if_none_match = if_none_match;
                 Ok(())
             }
@@ -381,9 +383,7 @@ impl<'a, E: Copy + Eq + std::hash::Hash> MessageHeader<'a, E> {
             // https://tools.ietf.org/html/rfc7233#section-3.2
             Header::IfRange => {
                 let etags = matcher::matcher(Natural::ORDER, &self.etags);
-                self.if_range = Some(
-                    parse_if_range(parsing::with_buf(etags.clone())).await?,
-                );
+                self.if_range = Some(parse_if_range(parsing::with_buf(etags.clone())).await?);
                 Ok(())
             }
         }
@@ -433,13 +433,13 @@ enum Header {
 }
 
 static BASE_HEADERS: [(&[u8], Header); 7] = [
-    (b"content-length", Header::ContentLength),
-    (b"connection", Header::Connection),
-    (b"if-modified-since", Header::IfModifiedSince),
-    (b"if-none-match", Header::IfNoneMatch),
-    (b"if-range", Header::IfRange),
-    (b"range", Header::Range),
-    (b"transfer-encoding", Header::TransferEncoding),
+    (b"content-length:", Header::ContentLength),
+    (b"connection:", Header::Connection),
+    (b"if-modified-since:", Header::IfModifiedSince),
+    (b"if-none-match:", Header::IfNoneMatch),
+    (b"if-range:", Header::IfRange),
+    (b"range:", Header::Range),
+    (b"transfer-encoding:", Header::TransferEncoding),
 ];
 
 enum Body {
@@ -506,16 +506,20 @@ async fn message<T: AsyncBufRead + Unpin>(reader: &mut T) -> Result<bool, Framin
 
     let mut message_header = Rc::new(RefCell::new(MessageHeader::new(etags, version)));
 
-    fold(reader, headers(
-        || parsing::with_buf(known_headers.clone()),
-        |header| {
-            let message_header = message_header.clone();
-            async move {
-                let mut message_header = message_header.borrow_mut();
-                message_header.parse_header_value(header.clone()).await
-            }
-        },
-    )).await?;
+    fold(
+        reader,
+        headers(
+            || parsing::with_buf(known_headers.clone()),
+            |header| {
+                let message_header = message_header.clone();
+                async move {
+                    let mut message_header = message_header.borrow_mut();
+                    message_header.parse_header_value(header.clone()).await
+                }
+            },
+        ),
+    )
+    .await?;
 
     let keep_alive = fold(reader, message_header.borrow().finish()).await?;
     Ok(keep_alive)

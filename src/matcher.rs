@@ -83,7 +83,42 @@ where
     /// which can't match the input seen so far are removed from future consideration. The portions
     /// which have just been checked are also ignored in future calls.
     pub fn push(&mut self, input: &[C::Item]) -> ParseResult<Option<V>> {
-        Poll::Pending
+        let idx = self
+            .patterns
+            .iter()
+            .position(|(pattern, _)| {
+                let common = input.len().min(pattern.len() - self.offset);
+                self.comparator.cmp(
+                    &pattern[self.offset..self.offset + common],
+                    &input[..common],
+                ) == Ordering::Equal
+            })
+            .unwrap_or(self.patterns.len());
+        self.patterns = &self.patterns[idx..];
+
+        let idx = self
+            .patterns
+            .iter()
+            .position(|(pattern, _)| {
+                let common = input.len().min(pattern.len() - self.offset);
+                self.comparator.cmp(
+                    &pattern[self.offset..self.offset + common],
+                    &input[..common],
+                ) != Ordering::Equal
+            })
+            .unwrap_or(self.patterns.len());
+        self.patterns = &self.patterns[..idx];
+
+        match self.patterns {
+            [] => Poll::Ready((0, None)),
+            [(pattern, value)] if pattern.len() - self.offset <= input.len() => {
+                Poll::Ready((pattern.len() - self.offset, Some(*value)))
+            }
+            _ => {
+                self.offset += input.len();
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -103,51 +138,6 @@ where
     move |input| state.push(input)
 }
 
-/*
-fn find_edge<V>(
-    buffer: &[u8],
-    patterns: &[(&[u8], V)],
-    offset: usize,
-    tiebreaker: Ordering,
-) -> usize {
-    let idx = patterns.binary_search_by(|(pattern, _)| {
-        if buffer.len() > pattern.len() {
-            pattern[offset..].cmp(&&buffer[offset..pattern.len()])
-        } else {
-            pattern[offset..buffer.len()]
-                .cmp(&buffer[offset..])
-                .then(Ordering::Greater)
-        }
-    });
-    match idx {
-        Ok(v) => v,
-        Err(v) => v,
-    }
-}
-
-let mut start = 0;
-
-loop {
-    let lo = find_edge(&self.buffer, patterns, start, Ordering::Greater);
-    patterns = &patterns[lo..];
-
-    let hi = find_edge(&self.buffer, patterns, start, Ordering::Less);
-    patterns = &patterns[..hi];
-
-    match patterns {
-        [] => return Poll::Pending,
-        [(pattern, value)] if pattern.len() <= self.buffer.len() => {
-            self.buffer.advance(pattern.len());
-            return Poll::Ready(Ok(*value));
-        }
-        _ => {}
-    }
-
-    start = self.buffer.len();
-    self.fill_buf().await?;
-}
-*/
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -165,15 +155,15 @@ mod test {
             ],
         );
 
-        assert_eq!(m.push(b"b"), None);
+        assert_eq!(m.push(b"b"), Poll::Pending);
         assert_eq!(m.patterns.len(), 3);
         assert_eq!(m.offset, 1);
 
-        assert_eq!(m.push(b"b"), None);
+        assert_eq!(m.push(b"b"), Poll::Pending);
         assert_eq!(m.patterns.len(), 1);
         assert_eq!(m.offset, 2);
 
-        assert_eq!(m.push(b"b"), Some((1, Some(3))));
+        assert_eq!(m.push(b"b"), Poll::Ready((1, Some(3))));
     }
 
     #[test]
@@ -188,26 +178,7 @@ mod test {
                 (b"ccc", 5),
             ],
         );
-        assert_eq!(m.push(b"bbb"), Some((3, Some(3))));
-    }
-
-    #[test]
-    fn partial_match_common_prefix() {
-        let mut m = Matcher::new(Natural::ORDER, &[(b"a", 1), (b"aa", 2), (b"aaa", 3)]);
-
-        assert_eq!(m.push(b"a"), None);
-        assert_eq!(m.patterns.len(), 3);
-        assert_eq!(m.offset, 1);
-
-        assert_eq!(m.clone().push(b"z"), Some((0, Some(1))));
-
-        assert_eq!(m.push(b"a"), None);
-        assert_eq!(m.patterns.len(), 2);
-        assert_eq!(m.offset, 2);
-
-        assert_eq!(m.clone().push(b"z"), Some((0, Some(2))));
-
-        assert_eq!(m.push(b"a"), Some((1, Some(3))));
+        assert_eq!(m.push(b"bbb"), Poll::Ready((3, Some(3))));
     }
 
     #[test]
@@ -222,7 +193,7 @@ mod test {
                 (b"ccc", 5),
             ],
         );
-        assert_eq!(m.push(b"bbbz"), Some((3, Some(3))));
+        assert_eq!(m.push(b"bbbz"), Poll::Ready((3, Some(3))));
     }
 
     #[test]
@@ -231,8 +202,8 @@ mod test {
             CaseInsensitiveASCII,
             &[(b"aBc", 1), (b"AbD", 2), (b"ABE", 3)],
         );
-        assert_eq!(m.clone().push(b"abd"), Some((3, Some(2))));
-        assert_eq!(m.clone().push(b"aBd"), Some((3, Some(2))));
-        assert_eq!(m.clone().push(b"ABD"), Some((3, Some(2))));
+        assert_eq!(m.clone().push(b"abd"), Poll::Ready((3, Some(2))));
+        assert_eq!(m.clone().push(b"aBd"), Poll::Ready((3, Some(2))));
+        assert_eq!(m.clone().push(b"ABD"), Poll::Ready((3, Some(2))));
     }
 }
