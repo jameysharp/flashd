@@ -83,31 +83,23 @@ where
     /// which can't match the input seen so far are removed from future consideration. The portions
     /// which have just been checked are also ignored in future calls.
     pub fn push(&mut self, input: &[C::Item]) -> ParseResult<Option<V>> {
-        let idx = self
-            .patterns
-            .iter()
-            .position(|(pattern, _)| {
-                let common = input.len().min(pattern.len() - self.offset);
-                self.comparator.cmp(
-                    &pattern[self.offset..self.offset + common],
-                    &input[..common],
-                ) == Ordering::Equal
-            })
-            .unwrap_or(self.patterns.len());
-        self.patterns = &self.patterns[idx..];
+        let mut iter = self.patterns.iter().map(|(pattern, _)| {
+            let common = input.len().min(pattern.len() - self.offset);
+            self.comparator.cmp(
+                &pattern[self.offset..self.offset + common],
+                &input[..common],
+            )
+        });
 
-        let idx = self
-            .patterns
-            .iter()
-            .position(|(pattern, _)| {
-                let common = input.len().min(pattern.len() - self.offset);
-                self.comparator.cmp(
-                    &pattern[self.offset..self.offset + common],
-                    &input[..common],
-                ) != Ordering::Equal
-            })
+        let start = iter
+            .position(|order| order == Ordering::Equal)
             .unwrap_or(self.patterns.len());
-        self.patterns = &self.patterns[..idx];
+
+        let length = iter
+            .position(|order| order != Ordering::Equal)
+            .unwrap_or(self.patterns.len() - start - 1);
+
+        self.patterns = &self.patterns[start..start + length + 1];
 
         match self.patterns {
             [] => Poll::Ready((0, None)),
