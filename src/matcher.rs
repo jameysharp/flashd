@@ -95,11 +95,12 @@ where
             .position(|order| order == Ordering::Equal)
             .unwrap_or(self.patterns.len());
 
-        let length = iter
-            .position(|order| order != Ordering::Equal)
-            .unwrap_or(self.patterns.len() - start - 1);
+        let length = iter.position(|order| order != Ordering::Equal);
 
-        self.patterns = &self.patterns[start..start + length + 1];
+        self.patterns = &self.patterns[start..];
+        if let Some(length) = length {
+            self.patterns = &self.patterns[..length + 1];
+        }
 
         match self.patterns {
             [] => Poll::Ready((0, None)),
@@ -134,9 +135,8 @@ where
 mod test {
     use super::*;
 
-    #[test]
-    fn partial_match() {
-        let mut m = Matcher::new(
+    fn sample() -> Matcher<'static, Natural<u8>, u8> {
+        Matcher::new(
             Natural::ORDER,
             &[
                 (b"aaa", 1),
@@ -145,7 +145,12 @@ mod test {
                 (b"bcc", 4),
                 (b"ccc", 5),
             ],
-        );
+        )
+    }
+
+    #[test]
+    fn partial_match() {
+        let mut m = sample();
 
         assert_eq!(m.push(b"b"), Poll::Pending);
         assert_eq!(m.patterns.len(), 3);
@@ -159,33 +164,45 @@ mod test {
     }
 
     #[test]
-    fn equal_length() {
-        let mut m = Matcher::new(
-            Natural::ORDER,
-            &[
-                (b"aaa", 1),
-                (b"baa", 2),
-                (b"bbb", 3),
-                (b"bcc", 4),
-                (b"ccc", 5),
-            ],
-        );
+    fn equal_length_first() {
+        let mut m = sample();
+        assert_eq!(m.push(b"aaa"), Poll::Ready((3, Some(1))));
+    }
+
+    #[test]
+    fn equal_length_mid() {
+        let mut m = sample();
         assert_eq!(m.push(b"bbb"), Poll::Ready((3, Some(3))));
     }
 
     #[test]
+    fn equal_length_last() {
+        let mut m = sample();
+        assert_eq!(m.push(b"ccc"), Poll::Ready((3, Some(5))));
+    }
+
+    #[test]
     fn long_input() {
-        let mut m = Matcher::new(
-            Natural::ORDER,
-            &[
-                (b"aaa", 1),
-                (b"baa", 2),
-                (b"bbb", 3),
-                (b"bcc", 4),
-                (b"ccc", 5),
-            ],
-        );
+        let mut m = sample();
         assert_eq!(m.push(b"bbbz"), Poll::Ready((3, Some(3))));
+    }
+
+    #[test]
+    fn mismatch_begin() {
+        let mut m = sample();
+        assert_eq!(m.push(b"000"), Poll::Ready((0, None)));
+    }
+
+    #[test]
+    fn mismatch_mid() {
+        let mut m = sample();
+        assert_eq!(m.push(b"bbc"), Poll::Ready((0, None)));
+    }
+
+    #[test]
+    fn mismatch_end() {
+        let mut m = sample();
+        assert_eq!(m.push(b"ddd"), Poll::Ready((0, None)));
     }
 
     #[test]
