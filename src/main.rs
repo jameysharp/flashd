@@ -2,13 +2,11 @@
 
 use blake2::{Blake2s, Digest};
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::rc::Rc;
 use std::task::Poll;
-use tokio::io::AsyncBufRead;
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 mod matcher;
@@ -26,6 +24,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let (mut socket, _) = listener.accept().await?;
+        tokio::spawn(connection(socket));
+    }
+}
+
+async fn connection<RW>(socket: RW)
+where
+    RW: AsyncRead + AsyncWrite + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(socket);
+    let mut reader = BufReader::new(reader);
+    loop {
+        if let Err(e) = message(&mut reader, &mut writer).await {
+            match e {
+                FramingError::End => {}
+                FramingError::BadSyntax => {
+                    let _ = send_response(&mut writer, ()).await;
+                }
+                FramingError::BadVersion => {
+                    let _ = send_response(&mut writer, ()).await;
+                }
+            }
+            break;
+        }
     }
 }
 
@@ -151,25 +172,6 @@ where
     required_newline().await?;
 
     Ok((method, version))
-}
-
-async fn headers<NF, NP, N, VF, VP>(name: NF, mut value: VF) -> Result<(), FramingError>
-where
-    NF: Fn() -> NP,
-    NP: Future<Output = Option<N>>,
-    N: Copy,
-    VF: FnMut(N) -> VP,
-    VP: Future<Output = Result<(), FramingError>>,
-{
-    while !newline().await? {
-        if let Some(v) = name().await {
-            skip_spaces().await;
-            value(v).await?;
-            continue;
-        }
-        skip_line().await?;
-    }
-    Ok(())
 }
 
 async fn cr() -> bool {
@@ -389,7 +391,7 @@ impl<'a, E: Copy + Eq + std::hash::Hash> MessageHeader<'a, E> {
         }
     }
 
-    pub async fn finish(&self) -> Result<bool, FramingError> {
+    pub async fn finish(&self) -> Result<(), FramingError> {
         match self.body {
             Body::None => {}
             Body::Length(n) => skip(n).await,
@@ -411,7 +413,7 @@ impl<'a, E: Copy + Eq + std::hash::Hash> MessageHeader<'a, E> {
             }
         }
 
-        Ok(self.persistent)
+        Ok(())
     }
 }
 
@@ -433,8 +435,8 @@ enum Header {
 }
 
 static BASE_HEADERS: [(&[u8], Header); 7] = [
-    (b"content-length:", Header::ContentLength),
     (b"connection:", Header::Connection),
+    (b"content-length:", Header::ContentLength),
     (b"if-modified-since:", Header::IfModifiedSince),
     (b"if-none-match:", Header::IfNoneMatch),
     (b"if-range:", Header::IfRange),
@@ -470,7 +472,11 @@ enum RangeCondition<E> {
     LastModified(i64),
 }
 
-async fn message<T: AsyncBufRead + Unpin>(reader: &mut T) -> Result<bool, FramingError> {
+async fn message<R, W>(reader: &mut R, writer: &mut W) -> Result<(), FramingError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     // Support only GET and HEAD methods (and maybe TRACE?). Seems like OPTIONS (e.g. CORS) really
     // only makes sense with a dynamic backend.
     let methods = matcher::matcher(
@@ -504,23 +510,42 @@ async fn message<T: AsyncBufRead + Unpin>(reader: &mut T) -> Result<bool, Framin
 
     let known_headers = matcher::matcher(CaseInsensitiveASCII, &known_headers);
 
-    let mut message_header = Rc::new(RefCell::new(MessageHeader::new(etags, version)));
-
-    fold(
-        reader,
-        headers(
-            || parsing::with_buf(known_headers.clone()),
-            |header| {
-                let message_header = message_header.clone();
-                async move {
-                    let mut message_header = message_header.borrow_mut();
-                    message_header.parse_header_value(header.clone()).await
-                }
-            },
-        ),
-    )
+    let message_header = fold(reader, async {
+        let mut message_header = MessageHeader::new(etags, version);
+        while !newline().await? {
+            if let Some(v) = parsing::with_buf(known_headers.clone()).await {
+                skip_spaces().await;
+                message_header.parse_header_value(v).await?;
+                continue;
+            }
+            skip_line().await?;
+        }
+        Ok(message_header)
+    })
     .await?;
 
-    let keep_alive = fold(reader, message_header.borrow().finish()).await?;
-    Ok(keep_alive)
+    if let Err(_) = tokio::try_join!(
+        fold(reader, message_header.finish()),
+        send_response(writer, ()),
+    ) {
+        Err(FramingError::End)
+    } else if message_header.persistent {
+        Ok(())
+    } else {
+        Err(FramingError::End)
+    }
+}
+
+const ERROR_500: &[u8] =
+    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 9\r\n\r\nNot yet!\n";
+
+async fn send_response<W>(writer: &mut W, response: ()) -> Result<(), FramingError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Err(_) = writer.write_all(ERROR_500).await {
+        Err(FramingError::End)
+    } else {
+        Ok(())
+    }
 }
