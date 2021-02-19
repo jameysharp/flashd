@@ -49,20 +49,24 @@ where
                 FramingError::End => {}
                 FramingError::BadSyntax => {
                     let _ = Response {
+                        head: false,
+                        close: true,
                         status: 400,
                         header_length: 2,
                         source: ResponseSource::Buffer(b"\r\nBad syntax in HTTP request\n"),
                     }
-                    .send(&mut writer, false, true)
+                    .send(&mut writer)
                     .await;
                 }
                 FramingError::BadVersion => {
                     let _ = Response {
+                        head: false,
+                        close: true,
                         status: 505,
                         header_length: 2,
                         source: ResponseSource::Buffer(b"\r\nHTTP version not supported\n"),
                     }
-                    .send(&mut writer, false, true)
+                    .send(&mut writer)
                     .await;
                 }
             }
@@ -553,29 +557,28 @@ where
     // - 405 Method Not Allowed (include "Allow: GET, HEAD")
     // - 406 Not Acceptable
 
-    let response = if method.is_none() {
+    let close = !message_header.persistent;
+    let response = if let Some(method) = method {
         Response {
-            status: 405,
-            header_length: 20,
-            source: ResponseSource::Buffer(b"Allow: GET, HEAD\r\n\r\nRequest method not allowed\n"),
-        }
-    } else {
-        Response {
+            head: matches!(method, Method::Head),
+            close,
             status: 500,
             header_length: 2,
             source: ResponseSource::Buffer(b"\r\nNot implemented yet!\n"),
+        }
+    } else {
+        Response {
+            head: false,
+            close,
+            status: 405,
+            header_length: 20,
+            source: ResponseSource::Buffer(b"Allow: GET, HEAD\r\n\r\nRequest method not allowed\n"),
         }
     };
 
     if let Err(_) = tokio::try_join!(
         fold(reader, message_header.finish()),
-        response
-            .send(
-                writer,
-                matches!(method, Some(Method::Head)),
-                !message_header.persistent
-            )
-            .map_err(|_| FramingError::End),
+        response.send(writer).map_err(|_| FramingError::End),
     ) {
         Err(FramingError::End)
     } else if message_header.persistent {
@@ -614,13 +617,15 @@ impl AsyncRead for ResponseSource {
 }
 
 struct Response {
+    head: bool,
+    close: bool,
     status: u16,
     header_length: u64,
     source: ResponseSource,
 }
 
 impl Response {
-    pub async fn send<W>(self, writer: &mut W, head: bool, close: bool) -> std::io::Result<()>
+    pub async fn send<W>(self, writer: &mut W) -> std::io::Result<()>
     where
         W: AsyncWrite + Unpin,
     {
@@ -638,7 +643,7 @@ impl Response {
             source_length - self.header_length,
         )?;
 
-        if close {
+        if self.close {
             buffer.extend_from_slice(b"Connection: close\r\n");
         }
 
@@ -647,7 +652,7 @@ impl Response {
         // adaptor is part of the pipeline in all cases; this prevents us from sending garbage to
         // the client if the file gets longer while we're reading it; and compared to the cost of
         // I/O, the arithmetic involved is basically free.
-        let source = self.source.take(if head {
+        let source = self.source.take(if self.head {
             self.header_length
         } else {
             source_length
