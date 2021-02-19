@@ -2,8 +2,8 @@
 
 use async_compat::CompatExt;
 use blake2::{Blake2s, Digest};
+use futures::io::{copy, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use futures::TryFutureExt;
-use futures::io::{AsyncWrite, AsyncWriteExt, copy};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::convert::TryInto;
@@ -55,14 +55,18 @@ where
                         status: 400,
                         header_length: 2,
                         source: ResponseSource::Buffer(b"\r\nBad syntax in HTTP request\n"),
-                    }.send(&mut writer, true).await;
+                    }
+                    .send(&mut writer, false, true)
+                    .await;
                 }
                 FramingError::BadVersion => {
                     let _ = Response {
                         status: 505,
                         header_length: 2,
                         source: ResponseSource::Buffer(b"\r\nHTTP version not supported\n"),
-                    }.send(&mut writer, true).await;
+                    }
+                    .send(&mut writer, false, true)
+                    .await;
                 }
             }
             break;
@@ -570,7 +574,13 @@ where
 
     if let Err(_) = tokio::try_join!(
         fold(reader, message_header.finish()),
-        response.send(writer, !message_header.persistent).map_err(|_| FramingError::End),
+        response
+            .send(
+                writer,
+                matches!(method, Some(Method::Head)),
+                !message_header.persistent
+            )
+            .map_err(|_| FramingError::End),
     ) {
         Err(FramingError::End)
     } else if message_header.persistent {
@@ -598,7 +608,7 @@ impl AsyncRead for ResponseSource {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context,
-        buf: &mut tokio::io::ReadBuf
+        buf: &mut tokio::io::ReadBuf,
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             ResponseSource::Buffer(b) => Pin::new(b).poll_read(cx, buf),
@@ -614,7 +624,7 @@ struct Response {
 }
 
 impl Response {
-    pub async fn send<W>(self, writer: &mut W, close: bool) -> std::io::Result<()>
+    pub async fn send<W>(self, writer: &mut W, head: bool, close: bool) -> std::io::Result<()>
     where
         W: AsyncWrite + Unpin,
     {
@@ -623,19 +633,31 @@ impl Response {
         // - Content-Length (varies depending on byte-ranges)
         // - Connection: close (depends on whether we understood the request)
 
+        let source_length = self.source.len().await?;
         let mut buffer = Vec::new();
         write!(
             &mut buffer,
             "HTTP/1.1 {} \r\nContent-Length: {}\r\n",
             self.status,
-            self.source.len().await? - self.header_length,
+            source_length - self.header_length,
         )?;
 
         if close {
             buffer.extend_from_slice(b"Connection: close\r\n");
         }
 
-        copy(&mut futures::io::AsyncReadExt::chain(&buffer[..], self.source.compat()), writer).await?;
+        // It should be unnecessary to call `take(source_length)` since that's exactly the length
+        // we believe we'll get if we read everything. But type-checking is simpler if the `Take`
+        // adaptor is part of the pipeline in all cases; this prevents us from sending garbage to
+        // the client if the file gets longer while we're reading it; and compared to the cost of
+        // I/O, the arithmetic involved is basically free.
+        let source = self.source.compat().take(if head {
+            self.header_length
+        } else {
+            source_length
+        });
+
+        copy(&mut (&buffer[..]).chain(source), writer).await?;
         Ok(())
     }
 }
