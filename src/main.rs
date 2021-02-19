@@ -1,12 +1,19 @@
 #![allow(unused)]
 
+use async_compat::CompatExt;
 use blake2::{Blake2s, Digest};
+use futures::TryFutureExt;
+use futures::io::{AsyncWrite, AsyncWriteExt, copy};
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::convert::TryInto;
 use std::future::Future;
+use std::io::Write;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::task::Poll;
-use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::fs::File;
+use tokio::io::{AsyncBufRead, AsyncRead, BufReader};
 use tokio::net::TcpListener;
 
 mod matcher;
@@ -30,24 +37,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn connection<RW>(socket: RW)
 where
-    RW: AsyncRead + AsyncWrite + Unpin,
+    RW: AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let (reader, mut writer) = tokio::io::split(socket);
+    let (reader, writer) = tokio::io::split(socket);
     let mut reader = BufReader::new(reader);
+    let mut writer = writer.compat();
     loop {
         if let Err(e) = message(&mut reader, &mut writer).await {
+            // no representation-specific headers, close connection after sending:
+            // - 400 Bad Request
+            // - 408 Request Timeout
+            // - 505 HTTP Version Not Supported
             match e {
                 FramingError::End => {}
                 FramingError::BadSyntax => {
-                    let _ = send_response(&mut writer, ()).await;
+                    let _ = Response {
+                        status: 400,
+                        header_length: 2,
+                        source: ResponseSource::Buffer(b"\r\nBad syntax in HTTP request\n"),
+                    }.send(&mut writer, true).await;
                 }
                 FramingError::BadVersion => {
-                    let _ = send_response(&mut writer, ()).await;
+                    let _ = Response {
+                        status: 505,
+                        header_length: 2,
+                        source: ResponseSource::Buffer(b"\r\nHTTP version not supported\n"),
+                    }.send(&mut writer, true).await;
                 }
             }
             break;
         }
     }
+
+    let _ = writer.close().await;
 }
 
 async fn skip(mut amt: usize) {
@@ -524,9 +546,31 @@ where
     })
     .await?;
 
+    // TODO: use message_header to decide how to respond.
+    // send headers from matching representation:
+    // - 206 Partial Content
+    // - 304 Not Modified
+    // no representation-specific headers:
+    // - 405 Method Not Allowed (include "Allow: GET, HEAD")
+    // - 406 Not Acceptable
+
+    let response = if method.is_none() {
+        Response {
+            status: 405,
+            header_length: 20,
+            source: ResponseSource::Buffer(b"Allow: GET, HEAD\r\n\r\nRequest method not allowed\n"),
+        }
+    } else {
+        Response {
+            status: 500,
+            header_length: 2,
+            source: ResponseSource::Buffer(b"\r\nNot implemented yet!\n"),
+        }
+    };
+
     if let Err(_) = tokio::try_join!(
         fold(reader, message_header.finish()),
-        send_response(writer, ()),
+        response.send(writer, !message_header.persistent).map_err(|_| FramingError::End),
     ) {
         Err(FramingError::End)
     } else if message_header.persistent {
@@ -536,16 +580,62 @@ where
     }
 }
 
-const ERROR_500: &[u8] =
-    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 9\r\n\r\nNot yet!\n";
+enum ResponseSource {
+    Buffer(&'static [u8]),
+    File(File),
+}
 
-async fn send_response<W>(writer: &mut W, response: ()) -> Result<(), FramingError>
-where
-    W: AsyncWrite + Unpin,
-{
-    if let Err(_) = writer.write_all(ERROR_500).await {
-        Err(FramingError::End)
-    } else {
+impl ResponseSource {
+    async fn len(&self) -> std::io::Result<u64> {
+        Ok(match self {
+            ResponseSource::Buffer(buf) => buf.len().try_into().unwrap(),
+            ResponseSource::File(f) => f.metadata().await?.len(),
+        })
+    }
+}
+
+impl AsyncRead for ResponseSource {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context,
+        buf: &mut tokio::io::ReadBuf
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ResponseSource::Buffer(b) => Pin::new(b).poll_read(cx, buf),
+            ResponseSource::File(f) => Pin::new(f).poll_read(cx, buf),
+        }
+    }
+}
+
+struct Response {
+    status: u16,
+    header_length: u64,
+    source: ResponseSource,
+}
+
+impl Response {
+    pub async fn send<W>(self, writer: &mut W, close: bool) -> std::io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        // add response headers:
+        // - Date (necessarily dynamic)
+        // - Content-Length (varies depending on byte-ranges)
+        // - Connection: close (depends on whether we understood the request)
+
+        let mut buffer = Vec::new();
+        write!(
+            &mut buffer,
+            "HTTP/1.1 {} \r\nContent-Length: {}\r\n",
+            self.status,
+            self.source.len().await? - self.header_length,
+        )?;
+
+        if close {
+            buffer.extend_from_slice(b"Connection: close\r\n");
+        }
+
+        copy(&mut futures::io::AsyncReadExt::chain(&buffer[..], self.source.compat()), writer).await?;
         Ok(())
     }
 }
