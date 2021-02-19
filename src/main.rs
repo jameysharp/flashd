@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use blake2::{Blake2s, Digest};
 use futures::TryFutureExt;
 use std::borrow::Cow;
@@ -30,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
 
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        let (socket, _) = listener.accept().await?;
         tokio::spawn(connection(socket));
     }
 }
@@ -128,10 +126,6 @@ fn expect(buf: &[u8], expected: u8) -> ParseResult<bool> {
     Poll::Ready((matched as usize, matched))
 }
 
-async fn colon() -> bool {
-    parsing::with_buf(|buf| expect(buf, b':')).await
-}
-
 async fn comma() -> bool {
     parsing::with_buf(|buf| expect(buf, b',')).await
 }
@@ -187,7 +181,7 @@ where
             Poll::Pending
         }
     })
-    .await;
+    .await?;
 
     let versions = matcher::matcher(Natural::ORDER, &[(b"HTTP/1.0", 0), (b"HTTP/1.1", 1)]);
     let version = parsing::with_buf(versions)
@@ -260,7 +254,7 @@ async fn http_date() -> Result<Option<i64>, FramingError> {
 
 struct ByteRanges;
 
-async fn byte_ranges(ranges: &mut ByteRanges) -> Result<(), FramingError> {
+async fn byte_ranges(_ranges: &mut ByteRanges) -> Result<(), FramingError> {
     // TODO: parse byte ranges
     skip_line().await
 }
@@ -517,8 +511,8 @@ where
     .await?;
 
     // TODO: open a resource, at `path`, or user-defined 404, or built-in 404
-    let path = base64::encode_config(&req_hash.finalize(), base64::URL_SAFE_NO_PAD);
-    let resource = ();
+    let _path = base64::encode_config(&req_hash.finalize(), base64::URL_SAFE_NO_PAD);
+    let _resource = ();
 
     let mut known_headers = Cow::from(&BASE_HEADERS[..]);
 
@@ -589,6 +583,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 enum ResponseSource {
     Buffer(&'static [u8]),
     File(File),

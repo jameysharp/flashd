@@ -207,7 +207,7 @@ mod test {
 
     #[test]
     fn case_insensitive() {
-        let mut m = Matcher::new(
+        let m = Matcher::new(
             CaseInsensitiveASCII,
             &[(b"aBc", 1), (b"AbD", 2), (b"ABE", 3)],
         );

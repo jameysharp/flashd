@@ -1,10 +1,7 @@
 use futures::future::poll_fn;
-use futures::pin_mut;
-use std::convert::TryInto;
 use std::future::Future;
-use std::ops::Deref;
 use std::pin::Pin;
-use std::task::*;
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 pub fn run<F, V>(buf: &mut &[u8], f: Pin<&mut F>) -> Poll<V>
 where
@@ -72,6 +69,7 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+    use futures::pin_mut;
 
     #[derive(Debug, Eq, PartialEq)]
     struct SyntaxError;
