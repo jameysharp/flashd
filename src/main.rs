@@ -374,8 +374,12 @@ impl<'a, E: Copy + Eq + std::hash::Hash> MessageHeader<'a, E> {
 
             // https://tools.ietf.org/html/rfc7232#section-3.2
             Header::IfNoneMatch => {
-                let mut if_none_match = std::mem::replace(&mut self.if_none_match, HashSet::new());
-                let etags = matcher::matcher(Natural::ORDER, &self.etags);
+                let MessageHeader {
+                    if_none_match,
+                    etags,
+                    ..
+                } = self;
+                let etags = matcher::matcher(Natural::ORDER, etags);
                 comma_separated(
                     || parsing::with_buf(etags.clone()),
                     |value| {
@@ -387,9 +391,7 @@ impl<'a, E: Copy + Eq + std::hash::Hash> MessageHeader<'a, E> {
                         Ok(())
                     },
                 )
-                .await?;
-                self.if_none_match = if_none_match;
-                Ok(())
+                .await
             }
 
             // https://tools.ietf.org/html/rfc7232#section-3.3
