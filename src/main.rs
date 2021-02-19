@@ -1,8 +1,6 @@
 #![allow(unused)]
 
-use async_compat::CompatExt;
 use blake2::{Blake2s, Digest};
-use futures::io::{copy, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use futures::TryFutureExt;
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -13,7 +11,9 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::task::Poll;
 use tokio::fs::File;
-use tokio::io::{AsyncBufRead, AsyncRead, BufReader};
+use tokio::io::{
+    copy, AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::TcpListener;
 
 mod matcher;
@@ -37,11 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn connection<RW>(socket: RW)
 where
-    RW: AsyncRead + tokio::io::AsyncWrite + Unpin,
+    RW: AsyncRead + AsyncWrite + Unpin,
 {
-    let (reader, writer) = tokio::io::split(socket);
+    let (reader, mut writer) = tokio::io::split(socket);
     let mut reader = BufReader::new(reader);
-    let mut writer = writer.compat();
     loop {
         if let Err(e) = message(&mut reader, &mut writer).await {
             // no representation-specific headers, close connection after sending:
@@ -73,7 +72,7 @@ where
         }
     }
 
-    let _ = writer.close().await;
+    let _ = writer.shutdown().await;
 }
 
 async fn skip(mut amt: usize) {
@@ -651,7 +650,7 @@ impl Response {
         // adaptor is part of the pipeline in all cases; this prevents us from sending garbage to
         // the client if the file gets longer while we're reading it; and compared to the cost of
         // I/O, the arithmetic involved is basically free.
-        let source = self.source.compat().take(if head {
+        let source = self.source.take(if head {
             self.header_length
         } else {
             source_length
