@@ -1,5 +1,5 @@
-use sha2::{Sha256, Digest};
 use futures::TryFutureExt;
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::convert::TryInto;
@@ -590,7 +590,10 @@ where
         let head = matches!(method, Method::Head);
 
         // TODO: select representation according to headers
-        let representation = resource.representations().get(0);
+        let representation_idx = 0;
+        let representation = resource.representations().get(representation_idx);
+
+        let not_modified = message_header.if_none_match.contains(&representation_idx);
 
         let source = if let Some(source) = representation.source_as_file_source() {
             if let Ok(file) = tokio::fs::File::open(source.filename()).await {
@@ -606,9 +609,13 @@ where
 
         if let Some(source) = source {
             Response {
-                head,
+                head: head || not_modified,
                 close,
-                status: representation.status(),
+                status: if not_modified {
+                    304
+                } else {
+                    representation.status()
+                },
                 header_length: representation.header_length(),
                 source,
             }
