@@ -7,8 +7,12 @@ license = "GPL-3.0-only"
 
 [dependencies]
 base64 = "0.13.0"
-blake2 = "0.9.1"
+flatbuffers = "0.6.1"
 memchr = "2"
+sha2 = "0.9.3"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3.12"
 async-compat = "0.2.0"
+
+[build-dependencies]
+flatc-rust = "0.2.0"

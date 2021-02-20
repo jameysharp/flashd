@@ -1,0 +1,3 @@
+#!/bin/sh
+
+echo -n "$1" | sha256sum | cut -f1 -d' ' | xxd -r -p | base64 | tr '+/' '-_' | tr -d =

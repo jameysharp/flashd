@@ -1,4 +1,4 @@
-use blake2::{Blake2s, Digest};
+use sha2::{Sha256, Digest};
 use futures::TryFutureExt;
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -22,6 +22,11 @@ mod parsing;
 #[macro_use]
 mod framing;
 use framing::{fold, FramingError, ParseResult};
+
+#[allow(non_snake_case, unused)]
+mod resource {
+    include!(concat!(env!("OUT_DIR"), "/resource_generated.rs"));
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -413,6 +418,9 @@ impl<'a, E: Copy + Eq + std::hash::Hash> MessageHeader<'a, E> {
                 self.if_range = Some(parse_if_range(parsing::with_buf(etags.clone())).await?);
                 Ok(())
             }
+
+            // TODO: process content negotiation
+            Header::Negotiation(_) => Ok(()),
         }
     }
 
@@ -457,6 +465,7 @@ enum Header {
     IfRange,
     Range,
     TransferEncoding,
+    Negotiation(usize),
 }
 
 static BASE_HEADERS: [(&[u8], Header); 7] = [
@@ -509,29 +518,48 @@ where
         &[(b"GET ", Method::Get), (b"HEAD ", Method::Head)],
     );
 
-    let mut req_hash = Blake2s::new();
+    let mut req_hash = Sha256::new();
     let (method, version) = fold(
         reader,
         request_line(parsing::with_buf(methods), |buf| req_hash.update(buf)),
     )
     .await?;
 
-    // TODO: open a resource, at `path`, or user-defined 404, or built-in 404
-    let _path = base64::encode_config(&req_hash.finalize(), base64::URL_SAFE_NO_PAD);
-    let _resource = ();
+    let path = base64::encode_config(&req_hash.finalize(), base64::URL_SAFE_NO_PAD);
+
+    // open a resource, at `path`, or user-defined 404, or built-in 404
+    let resource_buf = if let Ok(buf) = tokio::fs::read(path).await {
+        Cow::from(buf)
+    } else if let Ok(buf) = tokio::fs::read("error404").await {
+        Cow::from(buf)
+    } else {
+        Cow::from(&include_bytes!(concat!(env!("OUT_DIR"), "/404.http"))[..])
+    };
+    let resource = resource::get_root_as_resource(&resource_buf);
 
     let mut known_headers = Cow::from(&BASE_HEADERS[..]);
-
-    // TODO: if the selected resource has any negotiation headers ...
-    let negotiations = Vec::new();
-    if !negotiations.is_empty() {
-        let known_headers = known_headers.to_mut();
-        known_headers.extend_from_slice(&negotiations);
-        known_headers.sort_unstable_by(|(a, _), (b, _)| CaseInsensitiveASCII.cmp(a, b));
+    if let Some(negotiations) = resource.negotiations() {
+        if !negotiations.is_empty() {
+            let known_headers = known_headers.to_mut();
+            known_headers.extend(
+                negotiations
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, n)| (n.header().as_bytes(), Header::Negotiation(idx))),
+            );
+            known_headers.sort_unstable_by(|(a, _), (b, _)| CaseInsensitiveASCII.cmp(a, b));
+        }
     }
 
-    // TODO: if the selected resource has any representations with etags ...
-    let etags: Vec<(&[u8], ())> = Vec::new();
+    let mut etags = resource
+        .representations()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, representation)| {
+            representation.etag().map(|etag| (etag.as_bytes(), idx))
+        })
+        .collect::<Vec<_>>();
+    etags.sort_unstable();
 
     let known_headers = matcher::matcher(CaseInsensitiveASCII, &known_headers);
 
@@ -559,12 +587,39 @@ where
 
     let close = !message_header.persistent;
     let response = if let Some(method) = method {
-        Response {
-            head: matches!(method, Method::Head),
-            close,
-            status: 500,
-            header_length: 2,
-            source: ResponseSource::Buffer(b"\r\nNot implemented yet!\n"),
+        let head = matches!(method, Method::Head);
+
+        // TODO: select representation according to headers
+        let representation = resource.representations().get(0);
+
+        let source = if let Some(source) = representation.source_as_file_source() {
+            if let Ok(file) = tokio::fs::File::open(source.filename()).await {
+                Some(ResponseSource::File(file))
+            } else {
+                None
+            }
+        } else if let Some(source) = representation.source_as_inline_source() {
+            Some(ResponseSource::Buffer(source.contents().as_bytes()))
+        } else {
+            None
+        };
+
+        if let Some(source) = source {
+            Response {
+                head,
+                close,
+                status: representation.status(),
+                header_length: representation.header_length(),
+                source,
+            }
+        } else {
+            Response {
+                head,
+                close,
+                status: 500,
+                header_length: 2,
+                source: ResponseSource::Buffer(b"\r\nCouldn't load selected representation\n"),
+            }
         }
     } else {
         Response {
@@ -589,12 +644,12 @@ where
 }
 
 #[allow(dead_code)]
-enum ResponseSource {
-    Buffer(&'static [u8]),
+enum ResponseSource<'a> {
+    Buffer(&'a [u8]),
     File(File),
 }
 
-impl ResponseSource {
+impl ResponseSource<'_> {
     async fn len(&self) -> std::io::Result<u64> {
         Ok(match self {
             ResponseSource::Buffer(buf) => buf.len().try_into().unwrap(),
@@ -603,7 +658,7 @@ impl ResponseSource {
     }
 }
 
-impl AsyncRead for ResponseSource {
+impl AsyncRead for ResponseSource<'_> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context,
@@ -616,23 +671,24 @@ impl AsyncRead for ResponseSource {
     }
 }
 
-struct Response {
+struct Response<'a> {
     head: bool,
     close: bool,
     status: u16,
     header_length: u64,
-    source: ResponseSource,
+    source: ResponseSource<'a>,
 }
 
-impl Response {
+impl Response<'_> {
     pub async fn send<W>(self, writer: &mut W) -> std::io::Result<()>
     where
         W: AsyncWrite + Unpin,
     {
         // add response headers:
-        // - Date (necessarily dynamic)
-        // - Content-Length (varies depending on byte-ranges)
         // - Connection: close (depends on whether we understood the request)
+        // - Content-Length (varies depending on byte-ranges)
+        // - Date (necessarily dynamic)
+        // - Vary (a property of the resource, not the representation)
 
         let source_length = self.source.len().await?;
         let mut buffer = Vec::new();

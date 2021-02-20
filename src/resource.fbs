@@ -1,0 +1,172 @@
+/// A single HTTP resource, identified by a specific request target, may have
+/// multiple possible representations.
+///
+/// The client can express preferences about which representation to get using
+/// content negotiation. Each configured negotiation header assigns a qvalue to
+/// each representation; then the server multiplies those qvalues to get a
+/// final qvalue for each representation. Finally it selects the representation
+/// with the highest qvalue. In case of ties, it picks the lowest-index
+/// representation from this list, so you can express server-side preferences
+/// by placing higher-priority representations first. If there aren't any
+/// representations with a qvalue greater than 0, then it sends a 406 "Not
+/// Acceptable" error response instead.
+table Resource {
+  representations: [Representation] (required);
+  negotiations: [Negotiation];
+}
+
+/// Timestamps are represented as the number of seconds since midnight UTC on
+/// January 1st, 1970.
+struct Timestamp {
+  timestamp: int64;
+}
+
+/// The contents of this representation are stored in a separate file, so the
+/// same representation can be used for multiple resources.
+table FileSource {
+  filename: string (required);
+}
+
+/// The contents of this representation are stored inline.
+///
+/// This is probably faster than reading a separate file for very small
+/// responses, but should not be used for larger responses because the server
+/// reads the entire resource into memory. Note that this is limited to a UTF-8
+/// string to make constructing resources via JSON more convenient. If you need
+/// to serve arbitrary binary data, keep it in separate files; in most cases
+/// such data is probably too big to be reasonable to include inline anyway.
+table InlineSource {
+  contents: string (required);
+}
+
+union Source { FileSource, InlineSource }
+
+/// Metadata specific to a single representation.
+table Representation {
+  /// The source must
+  /// contain any custom headers and a blank line before the body of the
+  /// response. The headers and blank line must use CRLF ("\r\n") line endings,
+  /// but the body is treated as raw binary. The source must not contain an HTTP
+  /// status line or a Content-Length header; those will be added
+  /// automatically because the request headers may cause them to change.
+  source: Source;
+
+  /// By default, when this representation is selected it will be sent with
+  /// this HTTP status code. However, if the client makes a conditional or
+  /// range request, this status code may be overridden.
+  status: uint16 = 200;
+
+  /// How many octets are in the HTTP header at the beginning of this payload?
+  /// This includes the "\r\n" of the blank line which separates the header
+  /// from the body. The remainder of the file is considered the response body.
+  header_length: uint64;
+
+  // Cache validation headers:
+
+  /// If this representation includes an ETag header, the value of that header
+  /// should be copied here, including the double-quotes around the entity tag.
+  /// This allows the server to correctly handle conditional/range requests.
+  /// Currently only strong etags are supported, so this should not begin with
+  /// the "W/" marker indicating a weak etag.
+  etag: string;
+
+  /// If this representation includes a Last-Modified header, the value of that
+  /// header should be copied here. This allows the server to correctly handle
+  /// conditional/range requests.
+  last_modified: Timestamp;
+}
+
+/// Content negotiation works by the client specifying a qvalue list of
+/// preferences. This table describes which preferences this resource can
+/// satisfy.
+table Negotiation {
+  /// Which request header controls this content negotiation? The header name
+  /// must be specified with a trailing colon (":"). It is case-insensitive,
+  /// but I recommend adopting a convention of using only lowercase letters.
+  ///
+  /// Each header must only be listed once. It's preferable to list them in
+  /// sorted order, but not required.
+  ///
+  /// The most common example is `accept-encoding:`, but any header which uses
+  /// the same syntax is fine, including `accept:`, `accept-language:`, and
+  /// `accept-charset:`.
+  ///
+  /// Any request header listed here generally should have a matching response
+  /// header in every possible chosen representation. For example,
+  /// representations chosen according to an `accept-encoding: gzip` header
+  /// need a `content-encoding: gzip` header in the response.
+  header: string (key, required);
+
+  /// Each name which the client might use to describe this property of a
+  /// representation needs a separate entry in the Choice table. See that table
+  /// for details.
+  choices: [Choice] (required);
+
+  /// What value represents "match all representations"? If not specified this
+  /// is assumed to be "*", which is correct for most headers, but for
+  /// `accept:` the correct value is "*/*". The wildcard value has a lower
+  /// specificity than any choice and implicitly includes all representations.
+  /// If the header is not present, the server behaves as if the client
+  /// assigned a qvalue of 1 to the wildcard.
+  wildcard: string;
+
+  /// What should the server do if the request includes this header but without
+  /// a wildcard entry, and no representation matches the requested
+  /// preferences? If this flag is set, then all representations are assigned a
+  /// qvalue of 0 and the server will send a 406 "Not Acceptable" error
+  /// response. Otherwise, they're all assigned a qvalue of 1 and the request
+  /// header has no effect.
+  must_match: bool;
+}
+
+/// One preference the client might specify in content negotiation.
+table Choice {
+  /// A representation may match several different names that could appear in a
+  /// content negotiation header, generally because the specification for that
+  /// header describes some kind of partial-wildcard matching rules. Each
+  /// different option should be listed as a separate choice.
+  ///
+  /// For example, to allow content-type negotiation using the `accept:`
+  /// header, a representation with `content-type: text/html` should be listed
+  /// under choices for both `text/html` and `text/*`. (The `*/*` wildcard is
+  /// covered in the parent Negotiation table.)
+  ///
+  /// These names are always compared case-insensitively. Each name must be
+  /// listed only once. It's preferable to list them in sorted order, but not
+  /// required.
+  ///
+  /// The specification for each content negotiation header indicates the rules
+  /// for constructing the names used here, but you may need to be more
+  /// flexible to get the best results. For example, to allow natural-language
+  /// negotiation using the `accept-language:` header, a representation with
+  /// `content-language: zh-Hans-CN` (Chinese as written in the Simplified
+  /// script and as used in China) is specified per the "Basic Filtering"
+  /// scheme to match the language ranges `zh-Hans-CN`, `zh-Hans`, and `zh`.
+  /// However, you may also want it to match `zh-CN` (Chinese as used in China,
+  /// where the Simplified script is predominant). See [RFC4647][] for more on
+  /// matching language tags.
+  ///
+  /// [RFC4647]: https://tools.ietf.org/html/rfc4647
+  name: string (key, required);
+
+  /// If a request lists multiple names which match the same representation,
+  /// then the qvalue that the request associated with the most specific name
+  /// should be used for that representation. For example, `text/html` is more
+  /// specific than `text/*`, and `zh-Hans-CN` is more specific than `zh-CN` or
+  /// `zh-Hans`.
+  ///
+  /// Higher numeric values in this field indicate more specific names, but no
+  /// other meaning is assigned; it's up to the content producer to assign
+  /// values in whatever way makes sense.
+  specificity: uint8;
+
+  /// List each representation which matches this choice, as an index into the
+  /// top-level Resource's `representations` list. For example, a choice for
+  /// `accept: text/*` would list all representations having `content-type:
+  /// text/html` or `content-type: text/plain`.
+  representations: [uint16] (required);
+}
+
+root_type Resource;
+file_identifier "HTTP";
+file_extension "http";

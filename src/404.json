@@ -1,0 +1,12 @@
+{
+  "representations": [
+    {
+      "source_type": "InlineSource",
+      "source": {
+        "contents": "\r\nResource not found\n"
+      },
+      "header_length": 2,
+      "status": 404
+    }
+  ]
+}
