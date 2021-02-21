@@ -298,18 +298,28 @@ where
     }
 }
 
-struct MessageHeader<'a, E> {
-    etags: Vec<(&'a [u8], E)>,
+struct MessageHeader<'a> {
+    etags: Vec<(&'a [u8], usize)>,
     body: Body,
     persistent: bool,
-    if_none_match: HashSet<E>,
+    if_none_match: HashSet<usize>,
     if_modified_since: Option<i64>,
     range: ByteRanges,
-    if_range: Option<RangeCondition<E>>,
+    if_range: Option<RangeCondition<usize>>,
 }
 
-impl<'a, E: Copy + Eq + std::hash::Hash> MessageHeader<'a, E> {
-    pub fn new(etags: Vec<(&'a [u8], E)>, version: u8) -> Self {
+impl<'a> MessageHeader<'a> {
+    pub fn new(version: u8, resource: resource::Resource<'a>) -> Self {
+        let mut etags = resource
+            .representations()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, representation)| {
+                representation.etag().map(|etag| (etag.as_bytes(), idx))
+            })
+            .collect::<Vec<_>>();
+        etags.sort_unstable();
+
         MessageHeader {
             etags,
             body: Body::None,
@@ -551,20 +561,10 @@ where
         }
     }
 
-    let mut etags = resource
-        .representations()
-        .into_iter()
-        .enumerate()
-        .filter_map(|(idx, representation)| {
-            representation.etag().map(|etag| (etag.as_bytes(), idx))
-        })
-        .collect::<Vec<_>>();
-    etags.sort_unstable();
-
     let known_headers = matcher::matcher(CaseInsensitiveASCII, &known_headers);
 
     let message_header = fold(reader, async {
-        let mut message_header = MessageHeader::new(etags, version);
+        let mut message_header = MessageHeader::new(version, resource);
         while !newline().await? {
             if let Some(v) = parsing::with_buf(known_headers.clone()).await {
                 skip_spaces().await;
