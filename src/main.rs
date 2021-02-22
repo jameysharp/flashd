@@ -1,7 +1,7 @@
 use futures::TryFutureExt;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::future::Future;
 use std::io::Write;
@@ -298,6 +298,43 @@ where
     }
 }
 
+/// Fixed-point representation of qvalues, which are defined to range from 0.0 to 1.0 with three
+/// decimal digits of precision.
+///
+/// See [RFC7231 section 5.3.1](https://tools.ietf.org/html/rfc7231#section-5.3.1).
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct QValue(u16);
+
+impl QValue {
+    const ONE: Self = QValue(1000);
+    const ZERO: Self = QValue(0);
+}
+
+impl std::ops::Mul for QValue {
+    type Output = QValue;
+    fn mul(self, rhs: Self) -> Self {
+        // Widen to at least 20 bits so the intermediate product can't overflow:
+        let lhs: u32 = self.0.into();
+        let rhs: u32 = rhs.0.into();
+        // Take ceil(lhs*rhs) so multiplying non-zero qvalues will never produce 0:
+        let ceil = (lhs * rhs + 999) / 1000;
+        // After dividing by 1000, the intermediate product is back in the correct range:
+        QValue(ceil as u16)
+    }
+}
+
+enum NegotiationWildcard {
+    NotNegotiated,
+    NoWildcard,
+    QValue(QValue),
+}
+
+struct NegotiationState<'a> {
+    negotiation: resource::Negotiation<'a>,
+    qvalues: HashMap<u16, (u8, QValue)>,
+    wildcard: NegotiationWildcard,
+}
+
 struct MessageHeader<'a> {
     etags: Vec<(&'a [u8], usize)>,
     body: Body,
@@ -306,6 +343,7 @@ struct MessageHeader<'a> {
     if_modified_since: Option<i64>,
     range: ByteRanges,
     if_range: Option<RangeCondition<usize>>,
+    negotiations: Vec<NegotiationState<'a>>,
 }
 
 impl<'a> MessageHeader<'a> {
@@ -320,6 +358,19 @@ impl<'a> MessageHeader<'a> {
             .collect::<Vec<_>>();
         etags.sort_unstable();
 
+        let negotiations = if let Some(negotiations) = resource.negotiations() {
+            negotiations
+                .into_iter()
+                .map(|negotiation| NegotiationState {
+                    negotiation,
+                    qvalues: HashMap::new(),
+                    wildcard: NegotiationWildcard::NotNegotiated,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         MessageHeader {
             etags,
             body: Body::None,
@@ -328,7 +379,23 @@ impl<'a> MessageHeader<'a> {
             if_modified_since: None,
             range: ByteRanges,
             if_range: None,
+            negotiations,
         }
+    }
+
+    fn get_headers(&self) -> Cow<'a, [(&'a [u8], Header)]> {
+        let mut known_headers = Cow::from(&BASE_HEADERS[..]);
+        if !self.negotiations.is_empty() {
+            let known_headers = known_headers.to_mut();
+            known_headers.extend(
+                self.negotiations
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, n)| (n.negotiation.header().as_bytes(), Header::Negotiation(idx))),
+            );
+            known_headers.sort_unstable_by(|(a, _), (b, _)| CaseInsensitiveASCII.cmp(a, b));
+        }
+        known_headers
     }
 
     pub async fn parse_header_value(&mut self, header: Header) -> Result<(), FramingError> {
@@ -429,8 +496,147 @@ impl<'a> MessageHeader<'a> {
                 Ok(())
             }
 
-            // TODO: process content negotiation
-            Header::Negotiation(_) => Ok(()),
+            Header::Negotiation(idx) => {
+                let NegotiationState {
+                    negotiation,
+                    qvalues,
+                    wildcard,
+                } = &mut self.negotiations[idx];
+
+                if matches!(wildcard, NegotiationWildcard::NotNegotiated) {
+                    // This is the first copy of this header we've seen.
+                    *wildcard = NegotiationWildcard::NoWildcard;
+                }
+
+                let mut values = vec![(
+                    negotiation.wildcard().map_or(&b"*"[..], str::as_bytes),
+                    None,
+                )];
+                values.extend(
+                    negotiation
+                        .choices()
+                        .into_iter()
+                        .map(|choice| (choice.name().as_bytes(), Some(choice))),
+                );
+                values.sort_unstable_by(|(a, _), (b, _)| CaseInsensitiveASCII.cmp(a, b));
+
+                let values = matcher::matcher(CaseInsensitiveASCII, &values);
+
+                comma_separated(
+                    // TODO: parse qvalue, skip extensions
+                    || parsing::with_buf(values.clone()),
+                    |value| {
+                        // TODO: insert parsed qvalue
+                        let qvalue = QValue::ONE;
+                        match value {
+                            Some(Some(choice)) => {
+                                let new = (choice.specificity(), qvalue);
+                                for representation in choice.representations() {
+                                    let old =
+                                        qvalues.entry(representation).or_insert((0, QValue::ZERO));
+                                    if new > *old {
+                                        *old = new;
+                                    }
+                                }
+                            }
+                            Some(None) => {
+                                *wildcard = NegotiationWildcard::QValue(qvalue);
+                            }
+                            None => {}
+                        }
+                        Ok(())
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    fn select_best_representation(&self) -> Option<usize> {
+        let mut qualified = HashMap::new();
+        let mut wildcard = QValue::ONE;
+
+        for state in self.negotiations.iter() {
+            // First, check if there was a negotiation header we can't satisfy.
+            if state.qvalues.is_empty() {
+                match state.wildcard {
+                    // Client specified that anything they didn't list is unacceptable:
+                    NegotiationWildcard::QValue(QValue::ZERO) => return None,
+
+                    // Client didn't specify wildcard, and server says it must match:
+                    NegotiationWildcard::NoWildcard if state.negotiation.must_match() => return None,
+
+                    // Applying the same non-zero qvalue to all representations,
+                    NegotiationWildcard::QValue(_) |
+                    // or not specifying a wildcard when the server says matching is optional,
+                    NegotiationWildcard::NoWildcard |
+                    // are equivalent to not specifying the header at all:
+                    NegotiationWildcard::NotNegotiated => {}
+                }
+                continue;
+            }
+
+            let default = match state.wildcard {
+                // Something matched, so the header must have been present.
+                NegotiationWildcard::NotNegotiated => unreachable!(),
+
+                // Something matched, so we should only select one of the matches:
+                NegotiationWildcard::NoWildcard => QValue::ZERO,
+
+                // Unless the client said otherwise:
+                NegotiationWildcard::QValue(v) => v,
+            };
+
+            for (idx, qvalue) in qualified.iter_mut() {
+                let new = state
+                    .qvalues
+                    .get(idx)
+                    .map_or(default, |(_, qvalue)| *qvalue);
+                *qvalue = *qvalue * new;
+            }
+
+            for (idx, (_, qvalue)) in state.qvalues.iter() {
+                if *qvalue != default {
+                    qualified.entry(*idx).or_insert(wildcard * *qvalue);
+                }
+            }
+
+            wildcard = wildcard * default;
+        }
+
+        // Pick the representation with the highest qvalue; break ties with the lowest index. But
+        // only pick representations that beat the composite wildcard qvalue.
+        let best = qualified
+            .iter()
+            .filter(|(_, qvalue)| **qvalue > wildcard)
+            .max_by(|(idx_a, qvalue_a), (idx_b, qvalue_b)| {
+                qvalue_a.cmp(qvalue_b).then(idx_b.cmp(idx_a))
+            });
+
+        if let Some((best_idx, qvalue)) = best {
+            // This qvalue is strictly greater than wildcard, and wildcard is no smaller than zero.
+            debug_assert_ne!(*qvalue, QValue::ZERO);
+            Some((*best_idx).into())
+        } else if wildcard > QValue::ZERO {
+            // If nothing is better than the wildcard, then we need to pick the first
+            // representation that equals the wildcard, which might not appear in the `qualified`
+            // map.
+            let mut best_idx = 0;
+            loop {
+                let good = qualified.get(&best_idx).map_or(true, |qvalue| *qvalue == wildcard);
+                if good {
+                    break Some(best_idx.into());
+                }
+                if let Some(next) = best_idx.checked_add(1) {
+                    best_idx = next;
+                } else {
+                    break None;
+                }
+            }
+        } else {
+            // The best option we could find had a qvalue of 0, which means the client does not
+            // consider it acceptable and we shouldn't return anything.
+            None
         }
     }
 
@@ -547,24 +753,10 @@ where
     };
     let resource = resource::get_root_as_resource(&resource_buf);
 
-    let mut known_headers = Cow::from(&BASE_HEADERS[..]);
-    if let Some(negotiations) = resource.negotiations() {
-        if !negotiations.is_empty() {
-            let known_headers = known_headers.to_mut();
-            known_headers.extend(
-                negotiations
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, n)| (n.header().as_bytes(), Header::Negotiation(idx))),
-            );
-            known_headers.sort_unstable_by(|(a, _), (b, _)| CaseInsensitiveASCII.cmp(a, b));
-        }
-    }
-
-    let known_headers = matcher::matcher(CaseInsensitiveASCII, &known_headers);
-
     let message_header = fold(reader, async {
         let mut message_header = MessageHeader::new(version, resource);
+        let known_headers = message_header.get_headers();
+        let known_headers = matcher::matcher(CaseInsensitiveASCII, &known_headers);
         while !newline().await? {
             if let Some(v) = parsing::with_buf(known_headers.clone()).await {
                 skip_spaces().await;
@@ -589,43 +781,55 @@ where
     let response = if let Some(method) = method {
         let head = matches!(method, Method::Head);
 
-        // TODO: select representation according to headers
-        let representation_idx = 0;
-        let representation = resource.representations().get(representation_idx);
+        match message_header.select_best_representation() {
+            Some(idx) if idx < resource.representations().len() => {
+                let representation = resource.representations().get(idx);
 
-        let not_modified = message_header.if_none_match.contains(&representation_idx);
+                let not_modified = message_header.if_none_match.contains(&idx);
 
-        let source = if let Some(source) = representation.source_as_file_source() {
-            if let Ok(file) = tokio::fs::File::open(source.filename()).await {
-                Some(ResponseSource::File(file))
-            } else {
-                None
-            }
-        } else if let Some(source) = representation.source_as_inline_source() {
-            Some(ResponseSource::Buffer(source.contents().as_bytes()))
-        } else {
-            None
-        };
-
-        if let Some(source) = source {
-            Response {
-                head: head || not_modified,
-                close,
-                status: if not_modified {
-                    304
+                let source = if let Some(source) = representation.source_as_file_source() {
+                    if let Ok(file) = tokio::fs::File::open(source.filename()).await {
+                        Some(ResponseSource::File(file))
+                    } else {
+                        None
+                    }
+                } else if let Some(source) = representation.source_as_inline_source() {
+                    Some(ResponseSource::Buffer(source.contents().as_bytes()))
                 } else {
-                    representation.status()
-                },
-                header_length: representation.header_length(),
-                source,
+                    None
+                };
+
+                if let Some(source) = source {
+                    Response {
+                        head: head || not_modified,
+                        close,
+                        status: if not_modified {
+                            304
+                        } else {
+                            representation.status()
+                        },
+                        header_length: representation.header_length(),
+                        source,
+                    }
+                } else {
+                    Response {
+                        head,
+                        close,
+                        status: 500,
+                        header_length: 2,
+                        source: ResponseSource::Buffer(b"\r\nCouldn't load selected representation\n"),
+                    }
+                }
             }
-        } else {
-            Response {
-                head,
-                close,
-                status: 500,
-                header_length: 2,
-                source: ResponseSource::Buffer(b"\r\nCouldn't load selected representation\n"),
+
+            _ => {
+                Response {
+                    head,
+                    close,
+                    status: 406,
+                    header_length: 2,
+                    source: ResponseSource::Buffer(b"\r\nThis resource has no representation that can satisfy your request.\n"),
+                }
             }
         }
     } else {
