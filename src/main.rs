@@ -137,6 +137,10 @@ fn expect(buf: &[u8], expected: u8) -> ParseResult<bool> {
     Poll::Ready((matched as usize, matched))
 }
 
+async fn semicolon() -> bool {
+    parsing::with_buf(|buf| expect(buf, b';')).await
+}
+
 async fn comma() -> bool {
     parsing::with_buf(|buf| expect(buf, b',')).await
 }
@@ -650,7 +654,12 @@ impl<'a> MessageHeader<'a> {
                 // https://tools.ietf.org/html/rfc7230#section-4.1
                 loop {
                     let len = number(16).await.ok_or(FramingError::BadSyntax)?;
-                    skip_line().await?;
+                    skip_spaces().await;
+                    if semicolon().await {
+                        skip_line().await?;
+                    } else {
+                        required_newline().await?;
+                    }
                     if len == 0 {
                         break;
                     }
@@ -771,7 +780,6 @@ where
     })
     .await?;
 
-    // TODO: use message_header to decide how to respond.
     // send headers from matching representation:
     // - 206 Partial Content
     // - 304 Not Modified
