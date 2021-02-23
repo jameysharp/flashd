@@ -57,6 +57,7 @@ where
                         head: false,
                         close: true,
                         status: 400,
+                        vary: Vec::new(),
                         header_length: 2,
                         source: ResponseSource::Buffer(b"\r\nBad syntax in HTTP request\n"),
                     }
@@ -68,6 +69,7 @@ where
                         head: false,
                         close: true,
                         status: 505,
+                        vary: Vec::new(),
                         header_length: 2,
                         source: ResponseSource::Buffer(b"\r\nHTTP version not supported\n"),
                     }
@@ -781,6 +783,12 @@ where
     let response = if let Some(method) = method {
         let head = matches!(method, Method::Head);
 
+        let vary = if let Some(negotiations) = resource.negotiations() {
+            negotiations.iter().map(|negotiation| negotiation.header().as_bytes()).collect()
+        } else {
+            Vec::new()
+        };
+
         match message_header.select_best_representation() {
             Some(idx) if idx < resource.representations().len() => {
                 let representation = resource.representations().get(idx);
@@ -808,6 +816,7 @@ where
                         } else {
                             representation.status()
                         },
+                        vary,
                         header_length: representation.header_length(),
                         source,
                     }
@@ -816,6 +825,7 @@ where
                         head,
                         close,
                         status: 500,
+                        vary,
                         header_length: 2,
                         source: ResponseSource::Buffer(b"\r\nCouldn't load selected representation\n"),
                     }
@@ -827,6 +837,7 @@ where
                     head,
                     close,
                     status: 406,
+                    vary,
                     header_length: 2,
                     source: ResponseSource::Buffer(b"\r\nThis resource has no representation that can satisfy your request.\n"),
                 }
@@ -837,6 +848,7 @@ where
             head: false,
             close,
             status: 405,
+            vary: Vec::new(),
             header_length: 20,
             source: ResponseSource::Buffer(b"Allow: GET, HEAD\r\n\r\nRequest method not allowed\n"),
         }
@@ -886,6 +898,7 @@ struct Response<'a> {
     head: bool,
     close: bool,
     status: u16,
+    vary: Vec<&'a [u8]>,
     header_length: u64,
     source: ResponseSource<'a>,
 }
@@ -909,6 +922,17 @@ impl Response<'_> {
             self.status,
             source_length - self.header_length,
         )?;
+
+        let mut vary = self.vary.into_iter();
+        if let Some(header) = vary.next() {
+            buffer.extend_from_slice(b"Vary: ");
+            buffer.extend_from_slice(&header[..header.len() - 1]);
+            for header in vary {
+                buffer.extend_from_slice(b", ");
+                buffer.extend_from_slice(&header[..header.len() - 1]);
+            }
+            buffer.extend_from_slice(b"\r\n");
+        }
 
         if self.close {
             buffer.extend_from_slice(b"Connection: close\r\n");
