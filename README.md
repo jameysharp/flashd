@@ -61,23 +61,95 @@ resource.fbs foo.json` to convert it to the binary representation.
 
 [FlatBuffers]: https://google.github.io/flatbuffers/
 
-Here's a trivial sample resource. This sample puts the representation
-inline instead of in a separate file, which is good as long as the
-response is very small and is valid UTF-8. Note that the `header_length`
-includes the `"\r\n"` that terminates the header section, which in this
-case is otherwise empty. The `status` field defaults to 200 if not
-specified, but I've made it explicit in this example.
+Here's a sample resource, illustrating use of most of the schema.
+
+- This example puts one representation inline instead of in a separate
+  file, which is good as long as the response is very small and is valid
+  UTF-8.
+- The other representations give filenames for the actual response data.
+  Constructing those files is left as an exercise to the reader.
+- Note that the `header_length` includes the `"\r\n"` that terminates
+  the header section, and remember that every representation must
+  include its headers (if any) and that blank line before the body.
+- The `status` field defaults to 200 if not specified, but I've made it
+  explicit in this example.
+- If you have an `ETag` header in a representation, you should copy its
+  value into the metadata so the server can correctly handle conditional
+  requests.
+- If you have multiple representations which are subject to content
+  negotiation, you need to tell the server which request headers should
+  select each representation. The header names must include a trailing
+  colon (":"). Also, for correct HTTP cache behavior, make sure each
+  representation gets a different ETag.
+
+Please see the documentation in `resource.fbs` for details.
 
 ```json
 {
   "representations": [
     {
+      "status": 200,
+      "etag": "\"ecf701f727d9e2d77c4aa49ac6fbbcc997278aca010bddeeb961c10cf54d435a\"",
       "source_type": "InlineSource",
       "source": {
-        "contents": "\r\nhello world!\n"
+        "contents": "Content-Type: text/plain; charset=us-ascii\r\nETag: \"ecf701f727d9e2d77c4aa49ac6fbbcc997278aca010bddeeb961c10cf54d435a\"\r\n\r\nhello world!\n"
       },
-      "header_length": 2,
-      "status": 200
+      "header_length": 120
+    },
+    {
+      "status": 200,
+      "etag": "\"597c0bff392438fe7398d9c936d75b35b5fe17d517350f067b51248761659287\"",
+      "source_type": "FileSource",
+      "source": {
+        "filename": "sample/sample.html"
+      },
+      "header_length": 119
+    },
+    {
+      "status": 200,
+      "etag": "\"3521640924b7f2dae82ecea6130ca67ae5efea5a0dabe0b802898eaa2cb3edd3\"",
+      "source_type": "FileSource",
+      "source": {
+        "filename": "sample/sample.html.gz"
+      },
+      "header_length": 143
+    }
+  ],
+  "negotiations": [
+    {
+      "header": "accept:",
+      "wildcard": "*/*",
+      "must_match": true,
+      "choices": [
+        {
+          "name": "text/plain",
+          "specificity": 2,
+          "representations": [0]
+        },
+        {
+          "name": "text/html",
+          "specificity": 2,
+          "representations": [1, 2]
+        },
+        {
+          "name": "text/*",
+          "specificity": 1,
+          "representations": [0, 1, 2]
+        }
+      ]
+    },
+    {
+      "header": "accept-encoding:",
+      "choices": [
+        {
+          "name": "identity",
+          "representations": [0, 1]
+        },
+        {
+          "name": "gzip",
+          "representations": [2]
+        }
+      ]
     }
   ]
 }
@@ -97,14 +169,11 @@ ra2hMXUyoovr9j_m7b6j5D3GfYAtB8WDld5xszNqeaM
 So if you name the binary version of the above sample
 `il7asoJjJEMhngUeSt4tHVu8Zxx4EFG_FDeJfL3-oPE` and run `flashd` from the
 same directory, then accessing `http://localhost:8080/` should return
-"hello world!"
+one of the variants you configured. If you use a graphical web browser,
+you'll probably get the compressed HTML version, while if you use curl
+without any options, you'll get the plain-text "hello world!"
 
 If the request target doesn't exist, the server will try to serve a
-resource file named `error404`; if that also doesn't exist, it will
-serve a compiled-in page converted from [`src/404.json`](src/404.json)
-at build time.
-
-There are a lot more options in the schema to support content
-negotiation and conditional requests (most of which I haven't actually
-implemented yet), so please see the documentation in `resource.fbs` for
-details.
+resource file named `error404`. If that also doesn't exist, it will
+serve a compiled-in page, which is generated during the build process
+from [`src/404.json`](src/404.json).
